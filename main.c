@@ -16,7 +16,7 @@
 
 PSP_MODULE_INFO("NFS PSP", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
-PSP_HEAP_SIZE_KB(16 * 1024);
+PSP_HEAP_SIZE_KB(20 * 1024);
 
 #define BASE_DIR   "ms0:/PSP/GAME/nfs mobile"
 #define ASSET_DIR  BASE_DIR "/assets"
@@ -30,6 +30,7 @@ PSP_HEAP_SIZE_KB(16 * 1024);
 #define WHEEL_MIRROR 1         /* 1 = gira 180 graus as rodas do lado esquerdo */
 #define FLIP_V     0           /* 1 = inverte o V das texturas */
 #define USE_LIGHTING 1         /* 0 = desliga a luz de hardware */
+#define SHOW_DIAG_ALWAYS 0     /* 1 = sempre mostra a tela de diagnostico ao abrir */
 #define MAX_WV     12
 #define MAX_TEX    128
 
@@ -96,7 +97,7 @@ static Tex g_tex[MAX_TEX];
 static int g_ntex;
 static char g_miss[6][48];
 static int g_nmiss;
-static char g_imginfo[4][80];
+static char g_imginfo[4][96];
 static int g_nimginfo;
 
 static M3G *M;
@@ -161,7 +162,8 @@ static void settings_save(float scale, int flip, int wheel) {
 /* ======================= Texturas ======================= */
 static int p2(int v, int cap) { int p = 8; while (p < v && p < cap) p <<= 1; return p; }
 
-/* rgba = bytes R,G,B,A. Reamostra para potencia de 2 (ate 512x512) e converte p/ 16 bits */
+/* rgba = bytes R,G,B,A. Reduz com media de caixa (ex.: 1024 -> 512) para potencia de 2 (max 512x512)
+   e converte para 16 bits. */
 static int tex_create(const uint8_t *rgba, int w, int h, const char *name) {
     if (g_ntex >= MAX_TEX || w <= 0 || h <= 0) return -1;
     int pw = p2(w, 512), ph = p2(h, 512);
@@ -172,11 +174,20 @@ static int tex_create(const uint8_t *rgba, int w, int h, const char *name) {
     uint16_t *d = memalign(16, (size_t)pw * ph * 2);
     if (!d) return -1;
     for (int y = 0; y < ph; y++) {
-        int sy = (int)((long long)y * h / ph);
+        int sy0 = (int)((long long)y * h / ph), sy1 = (int)((long long)(y + 1) * h / ph);
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        if (sy1 > h) sy1 = h;
         for (int x = 0; x < pw; x++) {
-            int sx = (int)((long long)x * w / pw);
-            uint32_t px = s[sy * w + sx];
-            uint32_t r = px & 255, g = (px >> 8) & 255, b = (px >> 16) & 255, a = px >> 24;
+            int sx0 = (int)((long long)x * w / pw), sx1 = (int)((long long)(x + 1) * w / pw);
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            if (sx1 > w) sx1 = w;
+            uint32_t r = 0, g = 0, b = 0, a = 0, cnt = 0;
+            for (int yy = sy0; yy < sy1; yy++)
+                for (int xx = sx0; xx < sx1; xx++) {
+                    uint32_t px = s[yy * w + xx];
+                    r += px & 255; g += (px >> 8) & 255; b += (px >> 16) & 255; a += px >> 24; cnt++;
+                }
+            r /= cnt; g /= cnt; b /= cnt; a /= cnt;
             d[y * pw + x] = alpha
                 ? (uint16_t)(((a >> 4) << 12) | ((b >> 4) << 8) | ((g >> 4) << 4) | (r >> 4))
                 : (uint16_t)(((b >> 3) << 11) | ((g >> 2) << 5) | (r >> 3));
@@ -335,7 +346,79 @@ static int fallback_tex(void) {
     return id;
 }
 
+/* ---- Image2D embutida ----
+   Formatos padrao: 96=A 97=L 98=LA 99=RGB 100=RGBA. Os valores 121..125 (ex.: 124, 125) sao tratados como
+   o formato padrao + 25 (124 = RGB, 125 = RGBA). O layout real e deduzido pelo tamanho dos dados. */
+static int px_bpp(int base) { return base == 96 ? 1 : base == 97 ? 1 : base == 98 ? 2 : base == 99 ? 3 : base == 100 ? 4 : 0; }
+
+static void px_expand(int base, const uint8_t *c, uint8_t *o) {
+    switch (base) {
+    case 96: o[0] = o[1] = o[2] = 255; o[3] = c[0]; break;
+    case 97: o[0] = o[1] = o[2] = c[0]; o[3] = 255; break;
+    case 98: o[0] = o[1] = o[2] = c[0]; o[3] = c[1]; break;
+    case 99: o[0] = c[0]; o[1] = c[1]; o[2] = c[2]; o[3] = 255; break;
+    default: o[0] = c[0]; o[1] = c[1]; o[2] = c[2]; o[3] = c[3]; break;
+    }
+}
+
+static void px16(int base, const uint8_t *c, uint8_t *o) {
+    unsigned v = c[0] | (c[1] << 8);
+    if (base == 100) {
+        o[0] = ((v >> 12) & 15) * 17; o[1] = ((v >> 8) & 15) * 17; o[2] = ((v >> 4) & 15) * 17; o[3] = (v & 15) * 17;
+    } else {
+        o[0] = ((v >> 11) & 31) * 255 / 31; o[1] = ((v >> 5) & 63) * 255 / 63; o[2] = (v & 31) * 255 / 31; o[3] = 255;
+    }
+}
+
+static uint8_t *decode_image(int fmt, uint32_t w, uint32_t h, const uint8_t *pal, uint32_t pl,
+                             const uint8_t *pix, uint32_t xl, char *why) {
+    int base = (fmt >= 121 && fmt <= 125) ? fmt - 25 : fmt;
+    int bpp = px_bpp(base);
+    uint32_t np = w * h;
+    uint8_t *out = malloc((size_t)np * 4);
+    if (!out) { strcpy(why, "sem memoria"); return NULL; }
+
+    if (pl > 0) {                                        /* paleta: indices de 8 ou 4 bits */
+        int bits = (xl >= np) ? 8 : (xl >= (np + 1) / 2) ? 4 : 0;
+        if (!bits) { free(out); strcpy(why, "indices"); return NULL; }
+        uint32_t entries = 1u << bits, es = pl / entries;
+        if (es < 1 || es > 4) { free(out); strcpy(why, "paleta"); return NULL; }
+        uint8_t table[256][4];
+        for (uint32_t i = 0; i < entries; i++) {
+            const uint8_t *c = pal + i * es;
+            if (es == 2) px16(base, c, table[i]);
+            else if (es == 3) px_expand(99, c, table[i]);
+            else if (es == 4) px_expand(100, c, table[i]);
+            else px_expand(97, c, table[i]);
+        }
+        for (uint32_t i = 0; i < np; i++) {
+            unsigned idx = (bits == 8) ? pix[i] : ((i & 1) ? (pix[i / 2] & 15) : (pix[i / 2] >> 4));
+            memcpy(out + i * 4, table[idx], 4);
+        }
+        return out;
+    }
+    if (bpp && xl >= np * bpp) {                         /* cru: RGB / RGBA / L / LA / A */
+        for (uint32_t i = 0; i < np; i++) px_expand(base, pix + (size_t)i * bpp, out + i * 4);
+        return out;
+    }
+    if (xl >= np * 2) {                                  /* 16 bits: RGB565 ou RGBA4444 */
+        for (uint32_t i = 0; i < np; i++) px16(base, pix + (size_t)i * 2, out + i * 4);
+        return out;
+    }
+    if (xl >= np) {                                      /* 8 bits: tons de cinza */
+        for (uint32_t i = 0; i < np; i++) px_expand(97, pix + i, out + i * 4);
+        return out;
+    }
+    free(out);
+    strcpy(why, "formato");
+    return NULL;
+}
+
 static int tex_from_image2d(const Obj *o, uint32_t idx) {
+    char name[64];
+    snprintf(name, sizeof name, "%s#img%u", M->base, (unsigned)idx);
+    for (int i = 0; i < g_ntex; i++) if (!strcmp(g_tex[i].name, name)) return i;   /* ja carregada */
+
     Rd r = { o->data, o->data + o->len, 0 };
     rd32(&r);
     { uint32_t n = rd32(&r); if (n > 0x10000) return -1; rdskip(&r, n * 4);
@@ -343,46 +426,36 @@ static int tex_from_image2d(const Obj *o, uint32_t idx) {
     int fmt = rd8(&r), mut = rd8(&r);
     uint32_t w = rd32(&r), h = rd32(&r);
     char *info = g_nimginfo < 4 ? g_imginfo[g_nimginfo++] : NULL;
-    if (info) snprintf(info, 80, "img%u fmt=%d mut=%d %ux%u", (unsigned)idx, fmt, mut, (unsigned)w, (unsigned)h);
-    if (r.bad || mut || w == 0 || h == 0 || w > 1024 || h > 1024) {
-        if (info) strncat(info, " (sem pixels)", 79 - strlen(info));
+    if (info) snprintf(info, 96, "%s f%d %ux%u", name, fmt, (unsigned)w, (unsigned)h);
+    if (r.bad || mut || w == 0 || h == 0 || w > 4096 || h > 4096) {
+        if (info) strncat(info, " sem pixels", 95 - strlen(info));
         return -1;
     }
-    int bpp = fmt == 96 ? 1 : fmt == 97 ? 1 : fmt == 98 ? 2 : fmt == 99 ? 3 : fmt == 100 ? 4 : 0;
-    if (!bpp) return -1;
     uint32_t pl = rd32(&r);
     const uint8_t *pal = r.p;
     rdskip(&r, pl);
     uint32_t xl = rd32(&r);
     const uint8_t *pix = r.p;
-    uint32_t np = w * h;
-    if (r.bad || (uint32_t)(r.e - r.p) < xl || (pl ? xl < np : xl < np * bpp)) {
-        if (info) strncat(info, " FALHA", 79 - strlen(info));
+    if (r.bad || (uint32_t)(r.e - r.p) < xl) {
+        if (info) strncat(info, " tamanho invalido", 95 - strlen(info));
         return -1;
     }
-    uint8_t *rgba = malloc((size_t)np * 4);
-    if (!rgba) return -1;
-    for (uint32_t i = 0; i < np; i++) {
-        const uint8_t *c;
-        if (pl) {
-            uint32_t k = (uint32_t)pix[i] * bpp;
-            if (k + bpp > pl) k = 0;
-            c = pal + k;
-        } else c = pix + (size_t)i * bpp;
-        uint8_t R = 255, G = 255, B = 255, A = 255;
-        switch (fmt) {
-        case 96:  A = c[0]; break;
-        case 97:  R = G = B = c[0]; break;
-        case 98:  R = G = B = c[0]; A = c[1]; break;
-        case 99:  R = c[0]; G = c[1]; B = c[2]; break;
-        default:  R = c[0]; G = c[1]; B = c[2]; A = c[3]; break;
-        }
-        rgba[i * 4] = R; rgba[i * 4 + 1] = G; rgba[i * 4 + 2] = B; rgba[i * 4 + 3] = A;
+    if (info) { char t[40]; snprintf(t, sizeof t, " pal=%u pix=%u", (unsigned)pl, (unsigned)xl); strncat(info, t, 95 - strlen(info)); }
+    LOG("%s fmt=%d %ux%u pal=%u pix=%u\n  pix:", name, fmt, (unsigned)w, (unsigned)h, (unsigned)pl, (unsigned)xl);
+    for (uint32_t i = 0; i < 16 && i < xl; i++) LOG(" %02x", pix[i]);
+    LOG("\n  pal:");
+    for (uint32_t i = 0; i < 16 && i < pl; i++) LOG(" %02x", pal[i]);
+    LOG("\n");
+
+    char why[32] = "";
+    uint8_t *rgba = decode_image(fmt, w, h, pal, pl, pix, xl, why);
+    if (!rgba) {
+        if (info) { strncat(info, " ERRO ", 95 - strlen(info)); strncat(info, why, 95 - strlen(info)); }
+        return -1;
     }
-    char name[64];
-    snprintf(name, sizeof name, "%s#img%u", M->base, (unsigned)idx);
     int id = tex_create(rgba, (int)w, (int)h, name);
     free(rgba);
+    if (info) strncat(info, id >= 0 ? " OK" : " ERRO tex", 95 - strlen(info));
     return id;
 }
 
@@ -587,7 +660,7 @@ static int appearance_tex(uint32_t app, int *wrap, int hasuv) {
             nat = texture2d_tex(ti, wrap);
         }
     }
-    if (slot < 0 && M->ntexobj == 0) slot = 0;      /* arquivo sem Texture2D: uma textura padrao */
+    if (slot < 0 && M->ntexobj == 0) slot = 0;
     if (slot < 0) return -1;
     OUT->slotmask |= 1u << (slot & 31);
     return slot_tex(slot, nat);
@@ -652,7 +725,7 @@ static void parse_node(Rd *r, float *m, int *enabled) {
 /* ======================= Geometria ======================= */
 static int reserve(int n) {
     if (OUT->nv + n <= OUT->capv) return 1;
-    int nc = OUT->capv ? OUT->capv * 2 : 4096;
+    int nc = OUT->capv ? OUT->capv + OUT->capv / 2 + 1024 : 4096;
     Vertex *nv = realloc(OUT->v, (size_t)nc * sizeof(Vertex));
     if (!nv) return 0;
     OUT->v = nv; OUT->capv = nc;
@@ -710,7 +783,7 @@ static void add_tri(const VBuf *vb, const float *world, const uint32_t id[3], in
         } else if (tex >= 0) { r = g = b = 255; }
         else { r = PAL[sub % 6][0]; g = PAL[sub % 6][1]; b = PAL[sub % 6][2]; }
 
-        float nn[3] = { n[0], n[1], n[2] };        /* normal: do arquivo se existir, senao da face */
+        float nn[3] = { n[0], n[1], n[2] };
         if (vb->nrm && id[i] < (uint32_t)vb->nrm->count) {
             const int16_t *q = vb->nrm->v + id[i] * vb->nrm->comps;
             float a = q[0], bb = q[1], cc = q[2];
@@ -798,7 +871,7 @@ static void visit(int idx, const float *parent, int depth) {
         if (g_pick < 0 && g_split == 0 && n >= 4) { g_split = idx; g_nsplit = (int)n; }
         for (uint32_t k = 0; k < n && !r.bad; k++) {
             int c = (int)rd32(&r);
-            if (g_pick >= 0 && idx == g_split) {      /* modo variante: so o filho escolhido */
+            if (g_pick >= 0 && idx == g_split) {
                 if ((int)k != g_pick) continue;
                 int sv = g_active;
                 g_active = 1;
@@ -873,6 +946,9 @@ static const char *load_model(const char *file, Model *out, int honorHidden, int
         if (m.obj[i].type == 17) m.t2dord[i] = ord++;
         if (m.obj[i].type == 20) parse_vertex_array(i);
     }
+    /* decodifica as imagens embutidas ANTES de montar a geometria (menor pico de memoria) */
+    for (int i = 1; i < m.nobj; i++)
+        if (m.obj[i].type == 17) { int w; texture2d_tex((uint32_t)i, &w); }
 
     for (int i = 1; i < m.nobj; i++) {
         if (m.obj[i].type != 9 && m.obj[i].type != 22) continue;
@@ -894,7 +970,11 @@ static const char *load_model(const char *file, Model *out, int honorHidden, int
     free(ref);
     LOG("total: %d triangulos, %d lotes\n", out->nv / 3, out->nb);
 
-    for (int i = 0; i < m.nobj; i++) free(m.va[i].v);   /* libera tudo do arquivo (a geometria ja foi copiada) */
+    if (out->nv > 0 && out->capv > out->nv) {          /* devolve a sobra de memoria */
+        Vertex *nv = realloc(out->v, (size_t)out->nv * sizeof(Vertex));
+        if (nv) { out->v = nv; out->capv = out->nv; }
+    }
+    for (int i = 0; i < m.nobj; i++) free(m.va[i].v);
     free(m.va); free(m.timg); free(m.t2dord); free(m.obj);
     for (int i = 0; i < m.nbufs; i++) free(m.bufs[i]);
     M = NULL;
@@ -930,7 +1010,7 @@ static int find_wheel_file(const char *carbase, char *out, size_t osz) {
     return found;
 }
 
-/* um arquivo de rodas com varios filhos (>=4) e tratado como catalogo: cada filho e uma variante */
+/* arquivo de rodas com varios filhos (>=4) = catalogo: cada filho e uma variante */
 static const char *load_wheels(const char *file) {
     for (int i = 0; i < MAX_WV; i++) model_free(&g_wv[i]);
     g_nwv = 0;
@@ -1320,6 +1400,9 @@ static const char *build_all(float scale) {
     if (g_log) fclose(g_log);
     g_log = fopen(LOG_PATH, "w");
 
+    scan_pngs();
+    for (int i = 0; i < g_npng; i++) LOG("png: %s %dx%d\n", g_pngs[i].name, g_pngs[i].w, g_pngs[i].h);
+
     g_what = CAR_FILE;
     const char *err = load_model(CAR_FILE, &g_car, 0, -1);
     if (err) return err;
@@ -1361,7 +1444,6 @@ static const char *build_all(float scale) {
     g_grid.ok = grid_build(&g_grid, &g_track);
     find_start(g_carLen * scale, &g_sx, &g_sy, &g_sz, g_how, sizeof g_how);
 
-    scan_pngs();
     diag("carro %.0fx%.0fx%.0f %dtris %dlotes %dc/tex", ex, ey, ez, g_car.nv / 3, g_car.nb, count_tex_batches(&g_car));
     diag(" sub=%d UV=%d T2D=%d I2D=%d Ext=%d", g_car.nsub, g_car.nuv, g_car.ntexobj, g_car.nimg, g_car.next);
     diag("pista %.0fx%.0fx%.0f %dtris %dlotes %dc/tex", trkx, trky, trkz, g_track.nv / 3, g_track.nb, count_tex_batches(&g_track));
@@ -1409,11 +1491,26 @@ int main(void) {
     g_wsel = 0;
     settings_load(&carScale, &flip, &g_wsel);
 
+    /* abre direto no jogo. A tela de diagnostico so aparece se as texturas da pista falharem;
+       segurar SELECT ao abrir leva ao seletor de texturas. */
     for (;;) {
         const char *err = build_all(carScale);
         if (err) { fatal(g_what, err); return 0; }
         sceKernelDcacheWritebackAll();
-        if (diag_screen() == 1) { picker(); continue; }
+
+        int select = 0;
+        {
+            SceCtrlData p;
+            for (int t = 0; t < 45 && !select; t++) {
+                sceCtrlPeekBufferPositive(&p, 1);
+                if (p.Buttons & PSP_CTRL_SELECT) select = 1;
+                sceKernelDelayThread(16667);
+            }
+        }
+        if (select) { picker(); continue; }
+        if (SHOW_DIAG_ALWAYS || count_tex_batches(&g_track) == 0) {
+            if (diag_screen() == 1) { picker(); continue; }
+        }
         break;
     }
     if (g_wsel < 0 || g_wsel >= g_nwv) g_wsel = 0;
@@ -1520,7 +1617,7 @@ int main(void) {
 
 #if USE_LIGHTING
         {
-            ScePspFVector3 ld = { 0.35f, 0.85f, 0.40f };      /* direcao PARA a luz (sol alto, atras-direita) */
+            ScePspFVector3 ld = { 0.35f, 0.85f, 0.40f };      /* direcao PARA a luz (sol alto) */
             sceGuEnable(GU_LIGHTING);
             sceGuEnable(GU_LIGHT0);
             sceGuColorMaterial(GU_AMBIENT | GU_DIFFUSE);
