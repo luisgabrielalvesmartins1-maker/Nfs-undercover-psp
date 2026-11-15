@@ -21,12 +21,17 @@ PSP_HEAP_SIZE_KB(16 * 1024);
 #define BASE_DIR   "ms0:/PSP/GAME/nfs mobile"
 #define ASSET_DIR  BASE_DIR "/assets"
 #define LOG_PATH   BASE_DIR "/log.txt"
+#define CFG_PATH   BASE_DIR "/textures.cfg"
+#define SET_PATH   BASE_DIR "/settings.cfg"
 #define CAR_FILE   "car_viper.m3g"
 #define TRACK_FILE "causeway.m3g"
-#define WHEEL_FILE ""        /* "" = procura sozinho em assets/ (nome com wheel/tire/tyre/rim) */
-#define CAR_SCALE  1.0f      /* L/R ajustam em tempo real; depois fixe aqui */
-#define WHEEL_MIRROR 1       /* 1 = gira 180 graus as rodas do lado esquerdo; troque se o aro ficar pra dentro */
-#define FLIP_V     0         /* 1 = inverte o V das texturas (se vierem de cabeca para baixo) */
+#define WHEEL_FILE ""          /* "" = procura sozinho (nome com wheel/tire/tyre/rim) */
+#define CAR_SCALE  1.0f        /* L/R ajustam em tempo real; START salva */
+#define WHEEL_MIRROR 1         /* 1 = gira 180 graus as rodas do lado esquerdo */
+#define FLIP_V     0           /* 1 = inverte o V das texturas */
+#define USE_LIGHTING 1         /* 0 = desliga a luz de hardware */
+#define MAX_WV     12
+#define MAX_TEX    128
 
 #define BUF_WIDTH  512
 #define SCR_WIDTH  480
@@ -67,55 +72,119 @@ typedef struct { int count, comps, size; int16_t *v; } VArr;
 typedef struct {
     Obj *obj; int nobj, cap;
     VArr *va;
-    int *timg;
+    int *timg, *t2dord;
     int ntexobj, fallback;
     char base[64];
+    void *bufs[16]; int nbufs;
 } M3G;
 
-typedef struct { VArr *pos, *col, *uv; float bias[3], scale, ubias[3], uscale; } VBuf;
+typedef struct { VArr *pos, *col, *uv, *nrm; float bias[3], scale, ubias[3], uscale; } VBuf;
 
-typedef struct { float u, v; uint32_t color; float x, y, z; } Vertex;
+typedef struct { float u, v; uint32_t color; float nx, ny, nz, x, y, z; } Vertex;
 typedef struct { int tex, wrap, start, count; } Batch;
 typedef struct {
     Vertex *v; int nv, capv;
     Batch *b; int nb, capb;
     float mn[3], mx[3];
     int nsub, nuv, ntexobj, nimg, next;
+    uint32_t slotmask;
+    char key[48];
 } Model;
 
-typedef struct { void *data; int w, h, alpha; char name[64]; } Tex;
-#define MAX_TEX 128
+typedef struct { void *data; int w, h, alpha, psm; char name[64]; } Tex;
 static Tex g_tex[MAX_TEX];
 static int g_ntex;
 static char g_miss[6][48];
 static int g_nmiss;
+static char g_imginfo[4][80];
+static int g_nimginfo;
 
 static M3G *M;
 static Model *OUT;
 static int g_sub, g_honor;
-static Model g_car, g_track, g_wheel;
+static int g_pick = -1, g_active = 1, g_split, g_nsplit;
+static Model g_car, g_track, g_wv[MAX_WV];
+static int g_nwv, g_wsel;
+
+static void model_free(Model *m) { free(m->v); free(m->b); memset(m, 0, sizeof *m); }
+
+/* ======================= Configuracao (texturas escolhidas / ajustes) ======================= */
+typedef struct { char model[48]; int slot; char png[48]; } Cfg;
+static Cfg g_cfg[64];
+static int g_ncfg;
+
+static const char *cfg_get(const char *model, int slot) {
+    for (int i = 0; i < g_ncfg; i++)
+        if (g_cfg[i].slot == slot && !strcmp(g_cfg[i].model, model)) return g_cfg[i].png;
+    return NULL;
+}
+static void cfg_set(const char *model, int slot, const char *png) {
+    for (int i = 0; i < g_ncfg; i++)
+        if (g_cfg[i].slot == slot && !strcmp(g_cfg[i].model, model)) { snprintf(g_cfg[i].png, sizeof g_cfg[i].png, "%s", png); return; }
+    if (g_ncfg >= 64) return;
+    snprintf(g_cfg[g_ncfg].model, sizeof g_cfg[0].model, "%s", model);
+    g_cfg[g_ncfg].slot = slot;
+    snprintf(g_cfg[g_ncfg].png, sizeof g_cfg[0].png, "%s", png);
+    g_ncfg++;
+}
+static void cfg_del(const char *model, int slot) {
+    for (int i = 0; i < g_ncfg; i++)
+        if (g_cfg[i].slot == slot && !strcmp(g_cfg[i].model, model)) { g_cfg[i] = g_cfg[g_ncfg - 1]; g_ncfg--; return; }
+}
+static void cfg_load(void) {
+    g_ncfg = 0;
+    FILE *f = fopen(CFG_PATH, "r");
+    if (!f) return;
+    char line[160], m[48], p[48];
+    int s;
+    while (fgets(line, sizeof line, f)) if (sscanf(line, "%47s %d %47s", m, &s, p) == 3) cfg_set(m, s, p);
+    fclose(f);
+}
+static void cfg_save(void) {
+    FILE *f = fopen(CFG_PATH, "w");
+    if (!f) return;
+    for (int i = 0; i < g_ncfg; i++) fprintf(f, "%s %d %s\n", g_cfg[i].model, g_cfg[i].slot, g_cfg[i].png);
+    fclose(f);
+}
+static void settings_load(float *scale, int *flip, int *wheel) {
+    FILE *f = fopen(SET_PATH, "r");
+    if (!f) return;
+    float s; int fl, w;
+    if (fscanf(f, "%f %d %d", &s, &fl, &w) == 3 && s > 0.0001f && s < 1000.0f) { *scale = s; *flip = fl; *wheel = w; }
+    fclose(f);
+}
+static void settings_save(float scale, int flip, int wheel) {
+    FILE *f = fopen(SET_PATH, "w");
+    if (f) { fprintf(f, "%f %d %d\n", scale, flip, wheel); fclose(f); }
+}
 
 /* ======================= Texturas ======================= */
 static int p2(int v, int cap) { int p = 8; while (p < v && p < cap) p <<= 1; return p; }
 
+/* rgba = bytes R,G,B,A. Reamostra para potencia de 2 (ate 512x512) e converte p/ 16 bits */
 static int tex_create(const uint8_t *rgba, int w, int h, const char *name) {
     if (g_ntex >= MAX_TEX || w <= 0 || h <= 0) return -1;
-    int pw = p2(w, 256), ph = p2(h, 256);
-    uint32_t *d = memalign(16, (size_t)pw * ph * 4);
-    if (!d) return -1;
+    int pw = p2(w, 512), ph = p2(h, 512);
     const uint32_t *s = (const uint32_t *)rgba;
-    int alpha = 0;
+    int translucent = 0;
+    for (int i = 0, n = w * h; i < n; i++) if ((s[i] >> 24) < 200) translucent++;
+    int alpha = translucent > (w * h) / 256;
+    uint16_t *d = memalign(16, (size_t)pw * ph * 2);
+    if (!d) return -1;
     for (int y = 0; y < ph; y++) {
         int sy = (int)((long long)y * h / ph);
         for (int x = 0; x < pw; x++) {
             int sx = (int)((long long)x * w / pw);
             uint32_t px = s[sy * w + sx];
-            if ((px >> 24) != 0xFF) alpha = 1;
-            d[y * pw + x] = px;
+            uint32_t r = px & 255, g = (px >> 8) & 255, b = (px >> 16) & 255, a = px >> 24;
+            d[y * pw + x] = alpha
+                ? (uint16_t)(((a >> 4) << 12) | ((b >> 4) << 8) | ((g >> 4) << 4) | (r >> 4))
+                : (uint16_t)(((b >> 3) << 11) | ((g >> 2) << 5) | (r >> 3));
         }
     }
     Tex *t = &g_tex[g_ntex];
     t->data = d; t->w = pw; t->h = ph; t->alpha = alpha;
+    t->psm = alpha ? GU_PSM_4444 : GU_PSM_5650;
     snprintf(t->name, sizeof t->name, "%s", name);
     LOG("textura %d: %s (%dx%d -> %dx%d, alpha=%d)\n", g_ntex, name, w, h, pw, ph, alpha);
     return g_ntex++;
@@ -185,25 +254,60 @@ static int tex_from_png_file(const char *fname) {
     return id;
 }
 
-static const char *BAD[] = { "wheel", "tire", "tyre", "glass", "shadow", "icon", "thumb", "menu", "logo", "light", "small" };
+/* ---- lista de PNGs de assets/ (nome + dimensoes lidas do cabecalho) ---- */
+typedef struct { char name[48]; int w, h; } PngInfo;
+static PngInfo g_pngs[700];
+static int g_npng, g_scanned;
 
-/* melhor .png de assets/ cujo nome contem 'base' (ou o trecho depois do 1o '_') */
-static int find_png(const char *base, char *out, size_t osz) {
-    char b[64], alt[64] = "";
-    lower(b, base, sizeof b);
-    const char *u = strchr(b, '_');
-    if (u && u[1]) snprintf(alt, sizeof alt, "%s", u + 1);
+static int png_cmp(const void *a, const void *b) { return strcmp(((const PngInfo *)a)->name, ((const PngInfo *)b)->name); }
+
+static void scan_pngs(void) {
+    if (g_scanned) return;
+    g_scanned = 1;
     SceUID d = sceIoDopen(ASSET_DIR);
-    if (d < 0) return 0;
+    if (d < 0) return;
     SceIoDirent e;
-    int best = 0;
     for (;;) {
         memset(&e, 0, sizeof e);
         if (sceIoDread(d, &e) <= 0) break;
         char low[256];
         lower(low, e.d_name, sizeof low);
         size_t n = strlen(low);
-        if (n <= 4 || strcmp(low + n - 4, ".png")) continue;
+        if (n <= 4 || strcmp(low + n - 4, ".png") || g_npng >= 700) continue;
+        PngInfo *p = &g_pngs[g_npng];
+        snprintf(p->name, sizeof p->name, "%s", e.d_name);
+        p->w = p->h = 0;
+        char path[300];
+        snprintf(path, sizeof path, "%s/%s", ASSET_DIR, e.d_name);
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            uint8_t hd[24];
+            if (fread(hd, 1, 24, f) == 24) {
+                p->w = (hd[16] << 24) | (hd[17] << 16) | (hd[18] << 8) | hd[19];
+                p->h = (hd[20] << 24) | (hd[21] << 16) | (hd[22] << 8) | hd[23];
+            }
+            fclose(f);
+        }
+        g_npng++;
+    }
+    sceIoDclose(d);
+    qsort(g_pngs, g_npng, sizeof(PngInfo), png_cmp);
+}
+
+static const char *BAD[] = { "wheel", "tire", "tyre", "glass", "shadow", "icon", "thumb", "menu", "logo", "light", "small" };
+
+/* melhor .png cujo nome contem 'base' (ou o trecho depois do 1o '_') */
+static int find_png(const char *base, char *out, size_t osz) {
+    char b[64], alt[64] = "";
+    lower(b, base, sizeof b);
+    const char *u = strchr(b, '_');
+    if (u && u[1]) snprintf(alt, sizeof alt, "%s", u + 1);
+    scan_pngs();
+    int best = 0;
+    for (int i = 0; i < g_npng; i++) {
+        char low[64];
+        lower(low, g_pngs[i].name, sizeof low);
+        size_t n = strlen(low);
         int hb = strstr(low, b) != NULL;
         int ha = alt[0] && strstr(low, alt) != NULL;
         if (!hb && !ha) continue;
@@ -213,12 +317,11 @@ static int find_png(const char *base, char *out, size_t osz) {
         if (!strcmp(low, ex)) s += 100;
         if (hb) s += 50;
         if (ha) s += 30;
-        for (unsigned i = 0; i < sizeof BAD / sizeof BAD[0]; i++)
-            if (strstr(low, BAD[i]) && !strstr(b, BAD[i])) s -= 40;
+        for (unsigned k = 0; k < sizeof BAD / sizeof BAD[0]; k++)
+            if (strstr(low, BAD[k]) && !strstr(b, BAD[k])) s -= 40;
         s -= (int)n / 16;
-        if (s > best) { best = s; snprintf(out, osz, "%s", e.d_name); }
+        if (s > best) { best = s; snprintf(out, osz, "%s", g_pngs[i].name); }
     }
-    sceIoDclose(d);
     return best > 0;
 }
 
@@ -239,7 +342,12 @@ static int tex_from_image2d(const Obj *o, uint32_t idx) {
       n = rd32(&r); while (n-- && !r.bad) { rd32(&r); uint32_t l = rd32(&r); rdskip(&r, l); } }
     int fmt = rd8(&r), mut = rd8(&r);
     uint32_t w = rd32(&r), h = rd32(&r);
-    if (r.bad || mut || w == 0 || h == 0 || w > 1024 || h > 1024) return -1;
+    char *info = g_nimginfo < 4 ? g_imginfo[g_nimginfo++] : NULL;
+    if (info) snprintf(info, 80, "img%u fmt=%d mut=%d %ux%u", (unsigned)idx, fmt, mut, (unsigned)w, (unsigned)h);
+    if (r.bad || mut || w == 0 || h == 0 || w > 1024 || h > 1024) {
+        if (info) strncat(info, " (sem pixels)", 79 - strlen(info));
+        return -1;
+    }
     int bpp = fmt == 96 ? 1 : fmt == 97 ? 1 : fmt == 98 ? 2 : fmt == 99 ? 3 : fmt == 100 ? 4 : 0;
     if (!bpp) return -1;
     uint32_t pl = rd32(&r);
@@ -247,9 +355,11 @@ static int tex_from_image2d(const Obj *o, uint32_t idx) {
     rdskip(&r, pl);
     uint32_t xl = rd32(&r);
     const uint8_t *pix = r.p;
-    if (r.bad || (uint32_t)(r.e - r.p) < xl) return -1;
     uint32_t np = w * h;
-    if (pl ? xl < np : xl < np * bpp) return -1;
+    if (r.bad || (uint32_t)(r.e - r.p) < xl || (pl ? xl < np : xl < np * bpp)) {
+        if (info) strncat(info, " FALHA", 79 - strlen(info));
+        return -1;
+    }
     uint8_t *rgba = malloc((size_t)np * 4);
     if (!rgba) return -1;
     for (uint32_t i = 0; i < np; i++) {
@@ -340,6 +450,7 @@ static const char *load_m3g(const char *path) {
     uint8_t *buf = malloc(sz);
     if (!buf || fread(buf, 1, sz, f) != (size_t)sz) { fclose(f); return "falha ao ler o arquivo"; }
     fclose(f);
+    M->bufs[M->nbufs++] = buf;
     if (memcmp(buf, magic, 12) != 0) return "cabecalho nao e M3G/JSR-184";
 
     size_t pos = 12;
@@ -355,6 +466,7 @@ static const char *load_m3g(const char *path) {
         } else if (comp == 1) {
             uint8_t *dst = malloc(unc ? unc : 1);
             if (!dst) return "sem memoria para descomprimir";
+            if (M->nbufs < 16) M->bufs[M->nbufs++] = dst;
             if (!inflate_buf(src, srclen, dst, unc, 15) && !inflate_buf(src, srclen, dst, unc, -15))
                 return "falha ao descomprimir (zlib)";
             objs = dst; len = unc;
@@ -369,6 +481,7 @@ static const char *load_m3g(const char *path) {
             s.p += olen;
         }
         pos += total;
+        if (M->nbufs >= 15) break;
     }
     return NULL;
 }
@@ -413,7 +526,7 @@ static int parse_vbuf(uint32_t idx, VBuf *vb) {
     uint32_t pi = rd32(&r);
     for (int i = 0; i < 3; i++) vb->bias[i] = rdf(&r);
     vb->scale = rdf(&r);
-    rd32(&r);
+    uint32_t ni = rd32(&r);
     uint32_t ci = rd32(&r);
     uint32_t nt = rd32(&r);
     vb->uv = NULL; vb->uscale = 1.0f; vb->ubias[0] = vb->ubias[1] = vb->ubias[2] = 0;
@@ -427,6 +540,7 @@ static int parse_vbuf(uint32_t idx, VBuf *vb) {
     vb->pos = &M->va[pi];
     if (!vb->pos->v || vb->pos->comps < 3) return 0;
     vb->col = (ci > 0 && ci < (uint32_t)M->nobj && M->va[ci].v && M->va[ci].comps >= 3) ? &M->va[ci] : NULL;
+    vb->nrm = (ni > 0 && ni < (uint32_t)M->nobj && M->va[ni].v && M->va[ni].comps >= 3) ? &M->va[ni] : NULL;
     return 1;
 }
 
@@ -445,9 +559,22 @@ static int texture2d_tex(uint32_t ti, int *wrap) {
     return image_tex(img);
 }
 
+/* ordem: textura escolhida no seletor > textura do arquivo > png achado pelo nome */
+static int slot_tex(int slot, int nat) {
+    const char *o = cfg_get(M->base, slot);
+    if (o) {
+        if (!strcmp(o, "-")) return -1;
+        int id = tex_from_png_file(o);
+        if (id >= 0) return id;
+    }
+    if (nat >= 0) return nat;
+    return fallback_tex();
+}
+
 static int appearance_tex(uint32_t app, int *wrap, int hasuv) {
     *wrap = 1;
     if (!hasuv) return -1;
+    int slot = -1, nat = -1;
     if (app > 0 && app < (uint32_t)M->nobj && M->obj[app].type == 3) {
         Rd r = { M->obj[app].data, M->obj[app].data + M->obj[app].len, 0 };
         parse_object3d(&r);
@@ -455,12 +582,15 @@ static int appearance_tex(uint32_t app, int *wrap, int hasuv) {
         for (int i = 0; i < 4; i++) rd32(&r);
         uint32_t nt = rd32(&r);
         if (!r.bad && nt > 0) {
-            int tx = texture2d_tex(rd32(&r), wrap);
-            return tx >= 0 ? tx : fallback_tex();   /* referencia nao resolvida -> tenta pelo nome */
+            uint32_t ti = rd32(&r);
+            if (ti > 0 && ti < (uint32_t)M->nobj && M->t2dord[ti] >= 0) slot = M->t2dord[ti];
+            nat = texture2d_tex(ti, wrap);
         }
     }
-    if (M->ntexobj == 0) return fallback_tex();
-    return -1;
+    if (slot < 0 && M->ntexobj == 0) slot = 0;      /* arquivo sem Texture2D: uma textura padrao */
+    if (slot < 0) return -1;
+    OUT->slotmask |= 1u << (slot & 31);
+    return slot_tex(slot, nat);
 }
 
 /* ======================= Matrizes ======================= */
@@ -570,9 +700,7 @@ static void add_tri(const VBuf *vb, const float *world, const uint32_t id[3], in
     n[2] = e1[0] * e2[1] - e1[1] * e2[0];
     float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
     if (len < 1e-9f) return;
-    float d = fabsf(n[0] * 0.4f + n[1] * 0.8f + n[2] * 0.45f) / len;
-    float shade = 0.6f + 0.4f * d;
-    if (shade > 1.0f) shade = 1.0f;
+    n[0] /= len; n[1] /= len; n[2] /= len;
 
     if (!reserve(3)) return;
     for (int i = 0; i < 3; i++) {
@@ -581,6 +709,21 @@ static void add_tri(const VBuf *vb, const float *world, const uint32_t id[3], in
             r = col8(vb->col, id[i], 0); g = col8(vb->col, id[i], 1); b = col8(vb->col, id[i], 2);
         } else if (tex >= 0) { r = g = b = 255; }
         else { r = PAL[sub % 6][0]; g = PAL[sub % 6][1]; b = PAL[sub % 6][2]; }
+
+        float nn[3] = { n[0], n[1], n[2] };        /* normal: do arquivo se existir, senao da face */
+        if (vb->nrm && id[i] < (uint32_t)vb->nrm->count) {
+            const int16_t *q = vb->nrm->v + id[i] * vb->nrm->comps;
+            float a = q[0], bb = q[1], cc = q[2];
+            float l = sqrtf(a * a + bb * bb + cc * cc);
+            if (l > 1e-6f) {
+                a /= l; bb /= l; cc /= l;
+                float x_ = world[0] * a + world[1] * bb + world[2] * cc;
+                float y_ = world[4] * a + world[5] * bb + world[6] * cc;
+                float z_ = world[8] * a + world[9] * bb + world[10] * cc;
+                float wl = sqrtf(x_ * x_ + y_ * y_ + z_ * z_);
+                if (wl > 1e-6f) { nn[0] = x_ / wl; nn[1] = y_ / wl; nn[2] = z_ / wl; }
+            }
+        }
         Vertex *o = &OUT->v[OUT->nv++];
         o->u = 0; o->v = 0;
         if (vb->uv && id[i] < (uint32_t)vb->uv->count) {
@@ -589,7 +732,8 @@ static void add_tri(const VBuf *vb, const float *world, const uint32_t id[3], in
             o->v = t[1] * vb->uscale + vb->ubias[1];
             if (FLIP_V) o->v = 1.0f - o->v;
         }
-        o->color = 0xFF000000u | ((uint32_t)(b * shade) << 16) | ((uint32_t)(g * shade) << 8) | (uint32_t)(r * shade);
+        o->color = 0xFF000000u | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r;
+        o->nx = nn[0]; o->ny = nn[1]; o->nz = nn[2];
         o->x = P[i][0]; o->y = P[i][1]; o->z = P[i][2];
         for (int k = 0; k < 3; k++) {
             if (P[i][k] < OUT->mn[k]) OUT->mn[k] = P[i][k];
@@ -651,11 +795,22 @@ static void visit(int idx, const float *parent, int depth) {
     mat_mul(world, parent, local);
     if (t == 9 || t == 22) {
         uint32_t n = rd32(&r);
-        for (uint32_t k = 0; k < n && !r.bad; k++) visit((int)rd32(&r), world, depth + 1);
+        if (g_pick < 0 && g_split == 0 && n >= 4) { g_split = idx; g_nsplit = (int)n; }
+        for (uint32_t k = 0; k < n && !r.bad; k++) {
+            int c = (int)rd32(&r);
+            if (g_pick >= 0 && idx == g_split) {      /* modo variante: so o filho escolhido */
+                if ((int)k != g_pick) continue;
+                int sv = g_active;
+                g_active = 1;
+                visit(c, world, depth + 1);
+                g_active = sv;
+            } else visit(c, world, depth + 1);
+        }
     } else {
+        if (!g_active) return;
         uint32_t vbi = rd32(&r), ns = rd32(&r);
         VBuf vb;
-        if (r.bad || !parse_vbuf(vbi, &vb)) { LOG("  malha obj=%d IGNORADA (vertex buffer invalido)\n", idx); return; }
+        if (r.bad || !parse_vbuf(vbi, &vb)) { LOG("  malha obj=%d IGNORADA\n", idx); return; }
         for (uint32_t k = 0; k < ns && !r.bad; k++) {
             uint32_t ib = rd32(&r), app = rd32(&r);
             int wrap, tex = appearance_tex(app, &wrap, vb.uv != NULL);
@@ -670,23 +825,28 @@ static void visit(int idx, const float *parent, int depth) {
                     float p[3] = { OUT->v[i].x, OUT->v[i].y, OUT->v[i].z };
                     for (int q = 0; q < 3; q++) { if (p[q] < mn[q]) mn[q] = p[q]; if (p[q] > mx[q]) mx[q] = p[q]; }
                 }
-                LOG("  malha obj=%d sub=%d tris=%d uv=%d tex=%d bbox[%.2f %.2f %.2f]-[%.2f %.2f %.2f]\n",
-                    idx, g_sub, (OUT->nv - start) / 3, vb.uv != NULL, tex, mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]);
+                LOG("  malha obj=%d sub=%d tris=%d uv=%d nrm=%d tex=%d bbox[%.1f %.1f %.1f]-[%.1f %.1f %.1f]\n",
+                    idx, g_sub, (OUT->nv - start) / 3, vb.uv != NULL, vb.nrm != NULL, tex, mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]);
             }
             g_sub++;
         }
     }
 }
 
-static const char *load_model(const char *file, Model *out, int honorHidden) {
+static const char *load_model(const char *file, Model *out, int honorHidden, int pick) {
     M3G m;
     memset(&m, 0, sizeof m);
     m.nobj = 1; m.fallback = -2;
-    snprintf(m.base, sizeof m.base, "%s", file);
-    char *dot = strrchr(m.base, '.'); if (dot) *dot = 0;
-    memset(out, 0, sizeof *out);
+    char stem[64];
+    lower(stem, file, sizeof stem);
+    char *dot = strrchr(stem, '.'); if (dot) *dot = 0;
+    snprintf(m.base, sizeof m.base, "%s", stem);
+    model_free(out);
     for (int k = 0; k < 3; k++) { out->mn[k] = 1e30f; out->mx[k] = -1e30f; }
+    snprintf(out->key, sizeof out->key, "%s", m.base);
     M = &m; OUT = out; g_sub = 0; g_honor = honorHidden;
+    g_pick = pick; g_active = (pick < 0);
+    if (pick < 0) { g_split = 0; g_nsplit = 0; }
 
     char path[256];
     snprintf(path, sizeof path, "%s/%s", ASSET_DIR, file);
@@ -704,10 +864,15 @@ static const char *load_model(const char *file, Model *out, int honorHidden) {
 
     m.va = calloc(m.nobj, sizeof(VArr));
     m.timg = malloc(m.nobj * sizeof(int));
+    m.t2dord = malloc(m.nobj * sizeof(int));
     uint8_t *ref = calloc(m.nobj, 1);
-    if (!m.va || !m.timg || !ref) return "sem memoria";
-    for (int i = 0; i < m.nobj; i++) m.timg[i] = -2;
-    for (int i = 1; i < m.nobj; i++) if (m.obj[i].type == 20) parse_vertex_array(i);
+    if (!m.va || !m.timg || !m.t2dord || !ref) return "sem memoria";
+    int ord = 0;
+    for (int i = 0; i < m.nobj; i++) { m.timg[i] = -2; m.t2dord[i] = -1; }
+    for (int i = 1; i < m.nobj; i++) {
+        if (m.obj[i].type == 17) m.t2dord[i] = ord++;
+        if (m.obj[i].type == 20) parse_vertex_array(i);
+    }
 
     for (int i = 1; i < m.nobj; i++) {
         if (m.obj[i].type != 9 && m.obj[i].type != 22) continue;
@@ -727,12 +892,17 @@ static const char *load_model(const char *file, Model *out, int honorHidden) {
         if ((t == 9 || t == 14 || t == 15 || t == 16 || t == 22) && !ref[i]) visit(i, id, 0);
     }
     free(ref);
-    if (out->nv == 0) return "nenhuma malha/triangulo encontrado";
     LOG("total: %d triangulos, %d lotes\n", out->nv / 3, out->nb);
+
+    for (int i = 0; i < m.nobj; i++) free(m.va[i].v);   /* libera tudo do arquivo (a geometria ja foi copiada) */
+    free(m.va); free(m.timg); free(m.t2dord); free(m.obj);
+    for (int i = 0; i < m.nbufs; i++) free(m.bufs[i]);
+    M = NULL;
+    if (out->nv == 0 && pick < 0) return "nenhuma malha/triangulo encontrado";
     return NULL;
 }
 
-/* ======================= Rodas: acha o arquivo e prepara o modelo ======================= */
+/* ======================= Rodas ======================= */
 static int find_wheel_file(const char *carbase, char *out, size_t osz) {
     char b[64], alt[64] = "";
     lower(b, carbase, sizeof b);
@@ -760,26 +930,50 @@ static int find_wheel_file(const char *carbase, char *out, size_t osz) {
     return found;
 }
 
-/* centra a roda, alinha o eixo com X, ajusta a escala se estiver absurda; devolve raio e meia-largura */
-static void wheel_prepare(float carLen, float *R, float *halfW) {
-    Model *w = &g_wheel;
+/* um arquivo de rodas com varios filhos (>=4) e tratado como catalogo: cada filho e uma variante */
+static const char *load_wheels(const char *file) {
+    for (int i = 0; i < MAX_WV; i++) model_free(&g_wv[i]);
+    g_nwv = 0;
+    const char *e = load_model(file, &g_wv[0], 0, -1);
+    if (e) return e;
+    int ns = g_nsplit, sp = g_split;
+    g_nwv = 1;
+    if (ns >= 4) {
+        model_free(&g_wv[0]);
+        g_nwv = 0;
+        for (int k = 0; k < ns && k < 40 && g_nwv < MAX_WV; k++) {
+            g_split = sp; g_nsplit = ns;
+            if (!load_model(file, &g_wv[g_nwv], 0, k) && g_wv[g_nwv].nv > 0) g_nwv++;
+            else model_free(&g_wv[g_nwv]);
+        }
+        if (g_nwv == 0) return "nenhuma variante de roda";
+    }
+    return NULL;
+}
+
+/* centra a roda, alinha o eixo com X e corrige escala absurda */
+static void wheel_prepare(Model *w, float carLen, float *R, float *halfW) {
     float ext[3] = { w->mx[0] - w->mn[0], w->mx[1] - w->mn[1], w->mx[2] - w->mn[2] };
     float c[3] = { (w->mn[0] + w->mx[0]) * 0.5f, (w->mn[1] + w->mx[1]) * 0.5f, (w->mn[2] + w->mx[2]) * 0.5f };
     int ax = 0;
     if (ext[1] < ext[ax]) ax = 1;
-    if (ext[2] < ext[ax]) ax = 2;                    /* eixo da roda = dimensao mais fina */
+    if (ext[2] < ext[ax]) ax = 2;
     float diam = fmaxf(ext[(ax + 1) % 3], ext[(ax + 2) % 3]);
+    if (diam < 1e-6f) diam = 1.0f;
     float ratio = diam / carLen;
     float s = (ratio < 0.08f || ratio > 0.30f) ? (0.16f * carLen / diam) : 1.0f;
     for (int i = 0; i < w->nv; i++) {
-        float x = w->v[i].x - c[0], y = w->v[i].y - c[1], z = w->v[i].z - c[2], t;
-        if (ax == 2)      { t = z; z = -x; x = t; }  /* eixo Z -> X */
-        else if (ax == 1) { t = -y; y = x; x = t; }  /* eixo Y -> X */
-        w->v[i].x = x * s; w->v[i].y = y * s; w->v[i].z = z * s;
+        Vertex *v = &w->v[i];
+        float x = v->x - c[0], y = v->y - c[1], z = v->z - c[2], t;
+        float nx = v->nx, ny = v->ny, nz = v->nz;
+        if (ax == 2)      { t = z; z = -x; x = t;  t = nz; nz = -nx; nx = t; }
+        else if (ax == 1) { t = -y; y = x; x = t;  t = -ny; ny = nx; nx = t; }
+        v->x = x * s; v->y = y * s; v->z = z * s;
+        v->nx = nx; v->ny = ny; v->nz = nz;
     }
     *R = diam * s * 0.5f;
     *halfW = ext[ax] * s * 0.5f;
-    LOG("roda: eixo=%d diametro=%.2f largura=%.2f escala aplicada=%.3f\n", ax, diam, ext[ax], s);
+    LOG("roda: eixo=%d diametro=%.2f largura=%.2f escala=%.3f\n", ax, diam, ext[ax], s);
 }
 
 /* ======================= Terreno ======================= */
@@ -807,7 +1001,7 @@ static int grid_build(Grid *g, const Model *t) {
     for (int pass = 0; pass < 2; pass++) {
         for (int bi = 0; bi < t->nb; bi++) {
             const Batch *bt = &t->b[bi];
-            if (bt->tex >= 0 && g_tex[bt->tex].alpha) continue;       /* folhas/grades nao sao chao */
+            if (bt->tex >= 0 && g_tex[bt->tex].alpha) continue;
             int t0 = bt->start / 3, t1 = (bt->start + bt->count) / 3;
             for (int i = t0; i < t1; i++) {
                 const Vertex *v = &t->v[i * 3];
@@ -871,7 +1065,6 @@ static int is_road(const char *n) {
     return 0;
 }
 
-/* inicio: 1) triangulo com textura de "estrada" mais perto do centro; 2) espiral, superficie mais ALTA */
 static void find_start(float u, float *sx, float *sy, float *sz, char *how, size_t hsz) {
     float cx = (g_track.mn[0] + g_track.mx[0]) * 0.5f, cz = (g_track.mn[2] + g_track.mx[2]) * 0.5f;
     *sx = cx; *sy = g_track.mx[1]; *sz = cz;
@@ -896,7 +1089,7 @@ static void find_start(float u, float *sx, float *sy, float *sz, char *how, size
         float y;
         if (!ground_at(bx, bz, by + 1.0f * u, 0, &y)) y = by;
         *sx = bx; *sy = y; *sz = bz;
-        snprintf(how, hsz, "textura '%.30s'", bn);
+        snprintf(how, hsz, "textura '%.28s'", bn);
         return;
     }
     float step = g_grid.cs * 2.0f;
@@ -937,9 +1130,10 @@ static void init_gu(void) {
     sceGuEnable(GU_SCISSOR_TEST);
     sceGuDepthFunc(GU_GEQUAL);
     sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthMask(0);
     sceGuShadeModel(GU_SMOOTH);
     sceGuDisable(GU_CULL_FACE);
-    sceGuTexScale(1.0f, 1.0f);       /* sem isso a escala de UV pode ficar 0 e a textura vira cor solida */
+    sceGuTexScale(1.0f, 1.0f);
     sceGuTexOffset(0.0f, 0.0f);
     sceGuFinish();
     sceGuSync(0, 0);
@@ -948,13 +1142,13 @@ static void init_gu(void) {
 }
 
 static void draw_model(const Model *md) {
-    const int vt = GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D;
+    const int vt = GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D;
     for (int i = 0; i < md->nb; i++) {
         const Batch *b = &md->b[i];
         if (b->tex >= 0) {
             const Tex *t = &g_tex[b->tex];
             sceGuEnable(GU_TEXTURE_2D);
-            sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+            sceGuTexMode(t->psm, 0, 0, 0);
             sceGuTexImage(0, t->w, t->h, t->w, t->data);
             sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
             sceGuTexFilter(GU_LINEAR, GU_LINEAR);
@@ -983,16 +1177,222 @@ static void car_base(float px, float py, float pz, float heading, float pitch, f
     sceGumScale(&sc);
 }
 
+/* ======================= Seletor de texturas (tela de texto + miniatura) ======================= */
+static unsigned g_pprev;
+static int g_prep;
+
+static unsigned in_poll(void) {
+    SceCtrlData p;
+    sceCtrlPeekBufferPositive(&p, 1);
+    unsigned b = p.Buttons, pressed = b & ~g_pprev;
+    unsigned ud = PSP_CTRL_UP | PSP_CTRL_DOWN;
+    if (b & ud) { if (++g_prep > 20 && (g_prep % 3) == 0) pressed |= (b & ud); } else g_prep = 0;
+    g_pprev = b;
+    return pressed;
+}
+
+static void preview_png(int idx) {
+    volatile uint32_t *vr = (volatile uint32_t *)0x44000000;
+    for (int y = 0; y < 150; y++) for (int x = 0; x < 150; x++) vr[(40 + y) * 512 + 324 + x] = 0xFF202020;
+    if (idx < 0) return;
+    char path[300];
+    snprintf(path, sizeof path, "%s/%s", ASSET_DIR, g_pngs[idx].name);
+    int w, h;
+    uint8_t *px = load_png(path, &w, &h);
+    if (!px) return;
+    const uint32_t *s = (const uint32_t *)px;
+    int bw = w >= h ? 150 : 150 * w / h, bh = h > w ? 150 : 150 * h / w;
+    if (bw < 1) bw = 1;
+    if (bh < 1) bh = 1;
+    for (int y = 0; y < bh; y++)
+        for (int x = 0; x < bw; x++)
+            vr[(40 + y) * 512 + 324 + x] = s[(y * h / bh) * w + (x * w / bw)] | 0xFF000000u;
+    free(px);
+}
+
+/* devolve indice do png, -1 = sem textura, -2 = voltar, -3 = automatico */
+static int choose_png(const char *title, const char *cur) {
+    int sel = 0, shown = -2;
+    if (cur) for (int i = 0; i < g_npng; i++) if (!strcmp(g_pngs[i].name, cur)) sel = i;
+    for (;;) {
+        int top = sel - 10;
+        if (top < 0) top = 0;
+        pspDebugScreenSetXY(0, 0);
+        pspDebugScreenPrintf("%-39.39s\n", title);
+        pspDebugScreenPrintf("%-39.39s\n", "X=usar TRI=sem textura");
+        pspDebugScreenPrintf("%-39.39s\n", "QUAD=auto O=voltar L/R=pagina");
+        for (int r = 0; r < 24; r++) {
+            int i = top + r;
+            char line[80];
+            if (i < g_npng) snprintf(line, sizeof line, "%c%-24.24s %dx%d", i == sel ? '>' : ' ', g_pngs[i].name, g_pngs[i].w, g_pngs[i].h);
+            else line[0] = 0;
+            pspDebugScreenPrintf("%-39.39s\n", line);
+        }
+        if (shown != sel) { preview_png(sel); shown = sel; }
+        sceDisplayWaitVblankStart();
+        unsigned p = in_poll();
+        if ((p & PSP_CTRL_UP) && sel > 0) sel--;
+        if ((p & PSP_CTRL_DOWN) && sel < g_npng - 1) sel++;
+        if (p & PSP_CTRL_LTRIGGER) { sel -= 10; if (sel < 0) sel = 0; }
+        if (p & PSP_CTRL_RTRIGGER) { sel += 10; if (sel > g_npng - 1) sel = g_npng - 1; }
+        if (p & PSP_CTRL_CROSS) return sel;
+        if (p & PSP_CTRL_TRIANGLE) return -1;
+        if (p & PSP_CTRL_SQUARE) return -3;
+        if (p & PSP_CTRL_CIRCLE) return -2;
+    }
+}
+
+static int picker(void) {
+    scan_pngs();
+    pspDebugScreenInitEx((void *)0x44000000, PSP_DISPLAY_PIXEL_FORMAT_8888, 1);
+    if (g_npng == 0) {
+        pspDebugScreenPrintf("Nenhum .png encontrado em assets/\n");
+        sceKernelDelayThread(3000000);
+        return 0;
+    }
+    struct { const char *key; int slot; } sl[40];
+    int ns = 0;
+    for (int m = 0; m < 3; m++) {
+        const Model *md = m == 0 ? &g_car : m == 1 ? &g_wv[0] : &g_track;
+        uint32_t mask = md->slotmask;
+        if (m == 1) { mask = 0; for (int k = 0; k < g_nwv; k++) mask |= g_wv[k].slotmask; }
+        for (int b = 0; b < 32 && ns < 40; b++) if (mask & (1u << b)) { sl[ns].key = md->key; sl[ns].slot = b; ns++; }
+    }
+    SceCtrlData p0;
+    sceCtrlPeekBufferPositive(&p0, 1);
+    g_pprev = p0.Buttons;
+    if (ns == 0) {
+        pspDebugScreenPrintf("Nenhuma textura a escolher (sem UV).\n");
+        sceKernelDelayThread(3000000);
+        return 0;
+    }
+    int sel = 0, changed = 0;
+    pspDebugScreenClear();
+    for (;;) {
+        int top = sel - 12;
+        if (top < 0) top = 0;
+        pspDebugScreenSetXY(0, 0);
+        pspDebugScreenPrintf("%-39.39s\n", "ESCOLHA AS TEXTURAS");
+        pspDebugScreenPrintf("%-39.39s\n", "CIMA/BAIXO  X=escolher PNG");
+        pspDebugScreenPrintf("%-39.39s\n", "START=salvar  O=cancelar");
+        for (int r = 0; r < 26; r++) {
+            int i = top + r;
+            char line[96];
+            if (i < ns) {
+                const char *c = cfg_get(sl[i].key, sl[i].slot);
+                snprintf(line, sizeof line, "%c%s/%d: %s", i == sel ? '>' : ' ', sl[i].key, sl[i].slot, c ? c : "(auto)");
+            } else line[0] = 0;
+            pspDebugScreenPrintf("%-39.39s\n", line);
+        }
+        sceDisplayWaitVblankStart();
+        unsigned p = in_poll();
+        if ((p & PSP_CTRL_UP) && sel > 0) sel--;
+        if ((p & PSP_CTRL_DOWN) && sel < ns - 1) sel++;
+        if (p & PSP_CTRL_CROSS) {
+            char title[64];
+            snprintf(title, sizeof title, "%s/%d", sl[sel].key, sl[sel].slot);
+            pspDebugScreenClear();
+            int r = choose_png(title, cfg_get(sl[sel].key, sl[sel].slot));
+            if (r >= 0) { cfg_set(sl[sel].key, sl[sel].slot, g_pngs[r].name); changed = 1; }
+            else if (r == -1) { cfg_set(sl[sel].key, sl[sel].slot, "-"); changed = 1; }
+            else if (r == -3) { cfg_del(sl[sel].key, sl[sel].slot); changed = 1; }
+            pspDebugScreenClear();
+        }
+        if (p & PSP_CTRL_START) { if (changed) cfg_save(); return changed; }
+        if (p & PSP_CTRL_CIRCLE) { cfg_load(); return 0; }
+    }
+}
+
+/* ======================= Montagem da cena ======================= */
+static float g_carLen, g_carYaw0, g_wx, g_wz, g_trackExt, g_sx, g_sy, g_sz;
+static float g_wR[MAX_WV], g_wHW[MAX_WV];
+static char g_wmsg[96], g_how[64];
+static const char *g_what = "";
+
 static int count_tex_batches(const Model *m) {
     int n = 0;
     for (int i = 0; i < m->nb; i++) if (m->b[i].tex >= 0) n++;
     return n;
 }
 
-static void fatal(const char *what, const char *err) {
-    LOG("ERRO (%s): %s\n", what, err);
+static const char *build_all(float scale) {
+    g_diag[0] = 0; g_nmiss = 0; g_nimginfo = 0;
+    if (g_log) fclose(g_log);
+    g_log = fopen(LOG_PATH, "w");
+
+    g_what = CAR_FILE;
+    const char *err = load_model(CAR_FILE, &g_car, 0, -1);
+    if (err) return err;
+    g_what = TRACK_FILE;
+    err = load_model(TRACK_FILE, &g_track, 1, -1);
+    if (err) return err;
+
+    char stem[64], wfile[256] = "";
+    snprintf(stem, sizeof stem, "%s", CAR_FILE);
+    { char *d = strrchr(stem, '.'); if (d) *d = 0; }
+    if (WHEEL_FILE[0]) snprintf(wfile, sizeof wfile, "%s", WHEEL_FILE);
+    else find_wheel_file(stem, wfile, sizeof wfile);
+    g_nwv = 0;
+    snprintf(g_wmsg, sizeof g_wmsg, "nenhum arquivo de roda em assets/");
+    if (wfile[0]) {
+        const char *we = load_wheels(wfile);
+        if (we) snprintf(g_wmsg, sizeof g_wmsg, "%.28s: %.40s", wfile, we);
+        else snprintf(g_wmsg, sizeof g_wmsg, "%.28s: %d variante(s) (CIMA/BAIXO troca)", wfile, g_nwv);
+    }
+
+    float ex = g_car.mx[0] - g_car.mn[0], ez = g_car.mx[2] - g_car.mn[2], ey = g_car.mx[1] - g_car.mn[1];
+    float cx = (g_car.mn[0] + g_car.mx[0]) * 0.5f, cz = (g_car.mn[2] + g_car.mx[2]) * 0.5f, by = g_car.mn[1];
+    float carW = ex > ez ? ez : ex;
+    g_carLen = ex > ez ? ex : ez;
+    g_carYaw0 = (ex > ez) ? PI_F * 0.5f : 0.0f;
+
+    for (int k = 0; k < g_nwv; k++) wheel_prepare(&g_wv[k], g_carLen, &g_wR[k], &g_wHW[k]);
+    float lift = g_nwv ? 0.28f * g_wR[0] : 0.02f * g_carLen;
+    for (int i = 0; i < g_car.nv; i++) { g_car.v[i].x -= cx; g_car.v[i].y += lift - by; g_car.v[i].z -= cz; }
+    g_wx = carW * 0.5f - (g_nwv ? g_wHW[0] : 0.0f);
+    if (g_wx < 0.2f * carW) g_wx = 0.2f * carW;
+    g_wz = 0.29f * g_carLen;
+
+    float trkx = g_track.mx[0] - g_track.mn[0], trkz = g_track.mx[2] - g_track.mn[2], trky = g_track.mx[1] - g_track.mn[1];
+    g_trackExt = fmaxf(trkx, fmaxf(trkz, trky));
+
+    free(g_grid.start); free(g_grid.list);
+    memset(&g_grid, 0, sizeof g_grid);
+    g_grid.ok = grid_build(&g_grid, &g_track);
+    find_start(g_carLen * scale, &g_sx, &g_sy, &g_sz, g_how, sizeof g_how);
+
+    scan_pngs();
+    diag("carro %.0fx%.0fx%.0f %dtris %dlotes %dc/tex", ex, ey, ez, g_car.nv / 3, g_car.nb, count_tex_batches(&g_car));
+    diag(" sub=%d UV=%d T2D=%d I2D=%d Ext=%d", g_car.nsub, g_car.nuv, g_car.ntexobj, g_car.nimg, g_car.next);
+    diag("pista %.0fx%.0fx%.0f %dtris %dlotes %dc/tex", trkx, trky, trkz, g_track.nv / 3, g_track.nb, count_tex_batches(&g_track));
+    diag(" sub=%d UV=%d T2D=%d I2D=%d Ext=%d", g_track.nsub, g_track.nuv, g_track.ntexobj, g_track.nimg, g_track.next);
+    diag("PNGs em assets: %d | texturas carregadas: %d | cfg: %d", g_npng, g_ntex, g_ncfg);
+    for (int i = 0; i < g_nimginfo && i < 3; i++) diag(" %s", g_imginfo[i]);
+    for (int i = 0; i < g_nmiss && i < 2; i++) diag(" png nao carregado: %.40s", g_miss[i]);
+    diag("rodas: %s", g_wmsg);
+    diag("chao %s | inicio via %s", g_grid.ok ? "ok" : "FALHOU", g_how);
+    diag("inicio (%.1f, %.1f, %.1f)", g_sx, g_sy, g_sz);
     if (g_log) { fclose(g_log); g_log = NULL; }
-    pspDebugScreenInit();
+    return NULL;
+}
+
+static int diag_screen(void) {
+    pspDebugScreenInitEx((void *)0x44000000, PSP_DISPLAY_PIXEL_FORMAT_8888, 1);
+    pspDebugScreenPrintf("%s\nSELECT = escolher texturas    X = iniciar\n", g_diag);
+    SceCtrlData p;
+    sceCtrlPeekBufferPositive(&p, 1);
+    for (int t = 0; t < 1800; t++) {
+        sceCtrlPeekBufferPositive(&p, 1);
+        if (p.Buttons & PSP_CTRL_CROSS) return 0;
+        if (p.Buttons & PSP_CTRL_SELECT) return 1;
+        sceKernelDelayThread(16667);
+    }
+    return 0;
+}
+
+static void fatal(const char *what, const char *err) {
+    if (g_log) { fprintf(g_log, "ERRO (%s): %s\n", what, err); fclose(g_log); g_log = NULL; }
+    pspDebugScreenInitEx((void *)0x44000000, PSP_DISPLAY_PIXEL_FORMAT_8888, 1);
     pspDebugScreenPrintf("Erro ao carregar %s:\n%s\n\nVeja log.txt em:\n%s\n", what, err, BASE_DIR);
     sceKernelSleepThread();
 }
@@ -1002,83 +1402,28 @@ int main(void) {
     setup_callbacks();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
-    g_log = fopen(LOG_PATH, "w");
 
-    const char *err = load_model(CAR_FILE, &g_car, 0);
-    if (err) { fatal(CAR_FILE, err); return 0; }
-    err = load_model(TRACK_FILE, &g_track, 1);
-    if (err) { fatal(TRACK_FILE, err); return 0; }
+    cfg_load();
+    float carScale = CAR_SCALE;
+    int flip = 0;
+    g_wsel = 0;
+    settings_load(&carScale, &flip, &g_wsel);
 
-    /* rodas: arquivo separado (se existir) */
-    char stem[64], wfile[256] = "";
-    snprintf(stem, sizeof stem, "%s", CAR_FILE);
-    { char *d = strrchr(stem, '.'); if (d) *d = 0; }
-    if (WHEEL_FILE[0]) snprintf(wfile, sizeof wfile, "%s", WHEEL_FILE);
-    else find_wheel_file(stem, wfile, sizeof wfile);
-    int haveWheel = 0;
-    char wmsg[96] = "nenhum arquivo de roda em assets/";
-    if (wfile[0]) {
-        const char *we = load_model(wfile, &g_wheel, 0);
-        if (we) snprintf(wmsg, sizeof wmsg, "%.30s: %.40s", wfile, we);
-        else { haveWheel = 1; snprintf(wmsg, sizeof wmsg, "%.40s (%d tris)", wfile, g_wheel.nv / 3); }
+    for (;;) {
+        const char *err = build_all(carScale);
+        if (err) { fatal(g_what, err); return 0; }
+        sceKernelDcacheWritebackAll();
+        if (diag_screen() == 1) { picker(); continue; }
+        break;
     }
-
-    /* carro: origem no centro da base */
-    float ex = g_car.mx[0] - g_car.mn[0], ez = g_car.mx[2] - g_car.mn[2], ey = g_car.mx[1] - g_car.mn[1];
-    float cx = (g_car.mn[0] + g_car.mx[0]) * 0.5f, cz = (g_car.mn[2] + g_car.mx[2]) * 0.5f, by = g_car.mn[1];
-    float carLen = ex > ez ? ex : ez, carW = ex > ez ? ez : ex;
-    float carYaw0 = (ex > ez) ? PI_F * 0.5f : 0.0f;
-
-    float wheelR = 0, wheelHW = 0;
-    if (haveWheel) wheel_prepare(carLen, &wheelR, &wheelHW);
-    float lift = haveWheel ? 0.28f * wheelR : 0.02f * carLen;     /* folga entre a base do carro e o chao */
-    for (int i = 0; i < g_car.nv; i++) { g_car.v[i].x -= cx; g_car.v[i].y += lift - by; g_car.v[i].z -= cz; }
-
-    float wx = carW * 0.5f - wheelHW;
-    if (wx < 0.2f * carW) wx = 0.2f * carW;
-    float wz = 0.29f * carLen;
-
-    float trkx = g_track.mx[0] - g_track.mn[0], trkz = g_track.mx[2] - g_track.mn[2], trky = g_track.mx[1] - g_track.mn[1];
-    float trackExt = fmaxf(trkx, fmaxf(trkz, trky));
-
-    g_grid.ok = grid_build(&g_grid, &g_track);
-    float sx, sy, sz;
-    char how[64];
-    find_start(carLen * CAR_SCALE, &sx, &sy, &sz, how, sizeof how);
-
-    /* tela de diagnostico */
-    diag("carro %.1fx%.1fx%.1f: %d tris, %d lotes (%d c/ textura)", ex, ey, ez, g_car.nv / 3, g_car.nb, count_tex_batches(&g_car));
-    diag("  submalhas=%d c/UV=%d | Texture2D=%d Image2D=%d ExtRef=%d", g_car.nsub, g_car.nuv, g_car.ntexobj, g_car.nimg, g_car.next);
-    diag("pista %.0fx%.0fx%.0f: %d tris, %d lotes (%d c/ textura)", trkx, trky, trkz, g_track.nv / 3, g_track.nb, count_tex_batches(&g_track));
-    diag("  submalhas=%d c/UV=%d | Texture2D=%d Image2D=%d ExtRef=%d", g_track.nsub, g_track.nuv, g_track.ntexobj, g_track.nimg, g_track.next);
-    diag("texturas carregadas: %d", g_ntex);
-    for (int i = 0; i < g_nmiss && i < 4; i++) diag("  png nao carregado: %.44s", g_miss[i]);
-    diag("rodas: %s", wmsg);
-    diag("chao: %s | inicio via %s", g_grid.ok ? "ok" : "FALHOU", how);
-    diag("inicio (%.1f, %.1f, %.1f)", sx, sy, sz);
-    if (g_log) { fclose(g_log); g_log = NULL; }
-
-    sceKernelDcacheWritebackAll();
-
-    pspDebugScreenInit();
-    pspDebugScreenPrintf("%s\nDetalhes em %s/log.txt\n\nPressione X para iniciar...\n", g_diag, BASE_DIR);
-    {
-        SceCtrlData p;
-        for (int t = 0; t < 900; t++) {
-            sceCtrlPeekBufferPositive(&p, 1);
-            if (p.Buttons & PSP_CTRL_CROSS) break;
-            sceKernelDelayThread(16667);
-        }
-    }
+    if (g_wsel < 0 || g_wsel >= g_nwv) g_wsel = 0;
 
     init_gu();
 
     SceCtrlData pad;
     unsigned int prev = 0;
-    float carScale = CAR_SCALE, heading = 0, camHead = 0, speed = 0, pitch = 0, roll = 0;
-    float steerVis = 0, wheelRot = 0;
-    float px = sx, py = sy, pz = sz;
-    int flip = 0;
+    float heading = 0, camHead = 0, speed = 0, pitch = 0, roll = 0, steerVis = 0, wheelRot = 0;
+    float px = g_sx, py = g_sy, pz = g_sz;
     const float dt = 1.0f / 60.0f;
 
     while (1) {
@@ -1086,12 +1431,17 @@ int main(void) {
         unsigned int pressed = pad.Buttons & ~prev;
         prev = pad.Buttons;
 
-        if (pad.Buttons & PSP_CTRL_LTRIGGER) carScale *= 0.99f;
-        if (pad.Buttons & PSP_CTRL_RTRIGGER) carScale *= 1.01f;
+        if (pad.Buttons & PSP_CTRL_LTRIGGER) carScale *= 0.985f;
+        if (pad.Buttons & PSP_CTRL_RTRIGGER) carScale *= 1.015f;
         if (pressed & PSP_CTRL_TRIANGLE) flip ^= 1;
-        if (pressed & PSP_CTRL_SELECT) { px = sx; py = sy; pz = sz; speed = 0; heading += PI_F * 0.5f; camHead = heading; }
+        if (g_nwv > 1) {
+            if (pressed & PSP_CTRL_UP)   g_wsel = (g_wsel + 1) % g_nwv;
+            if (pressed & PSP_CTRL_DOWN) g_wsel = (g_wsel + g_nwv - 1) % g_nwv;
+        }
+        if (pressed & PSP_CTRL_START) settings_save(carScale, flip, g_wsel);
+        if (pressed & PSP_CTRL_SELECT) { px = g_sx; py = g_sy; pz = g_sz; speed = 0; heading += PI_F * 0.5f; camHead = heading; }
 
-        float u = carLen * carScale;
+        float u = g_carLen * carScale;
 
         if (pad.Buttons & PSP_CTRL_CROSS) speed += 8.0f * u * dt;
         else if (pad.Buttons & PSP_CTRL_SQUARE) speed -= (speed > 0 ? 16.0f : 6.0f) * u * dt;
@@ -1117,22 +1467,37 @@ int main(void) {
         float rx = cosf(heading), rz = sinf(heading);
         px += fx * speed * dt;
         pz += fz * speed * dt;
-        if (haveWheel) wheelRot -= (speed * dt / carScale) / (wheelR > 0.001f ? wheelR : 1.0f);
+        float wR = g_nwv ? g_wR[g_wsel] : 0.0f;
+        if (g_nwv) wheelRot -= (speed * dt / carScale) / (wR > 0.001f ? wR : 1.0f);
 
-        /* acompanha altura e inclinacao do chao */
+        /* apoia nas 4 rodas: altura, inclinacao e nenhuma roda abaixo do chao */
         if (g_grid.ok) {
-            float gy;
-            if (ground_at(px, pz, py + 0.6f * u, 0, &gy)) py += (gy - py) * 0.4f;
-            else py -= 8.0f * u * dt;
-            float d = 0.35f * u, yf, yr, yR, yL;
-            float tp = 0, tr = 0;
-            if (ground_at(px + fx * d, pz + fz * d, py + 0.6f * u, 0, &yf) &&
-                ground_at(px - fx * d, pz - fz * d, py + 0.6f * u, 0, &yr)) tp = atan2f(yf - yr, 2.0f * d);
-            float d2 = 0.2f * u;
-            if (ground_at(px + rx * d2, pz + rz * d2, py + 0.6f * u, 0, &yR) &&
-                ground_at(px - rx * d2, pz - rz * d2, py + 0.6f * u, 0, &yL)) tr = atan2f(yR - yL, 2.0f * d2);
-            pitch += (tp - pitch) * 0.2f;
-            roll  += (tr - roll) * 0.2f;
+            float wxs = g_wx * carScale, wzs = g_wz * carScale;
+            float gi[4], sum = 0;
+            int ok[4], nok = 0;
+            for (int k = 0; k < 4; k++) {
+                float lx = (k & 1) ? wxs : -wxs, lz = (k & 2) ? wzs : -wzs;
+                float x = px + rx * lx + fx * (-lz), z = pz + rz * lx + fz * (-lz);
+                ok[k] = ground_at(x, z, py + 0.6f * u, 0, &gi[k]);
+                if (ok[k]) { sum += gi[k]; nok++; }
+            }
+            if (nok > 0) {
+                float avg = sum / nok;
+                for (int k = 0; k < 4; k++) if (!ok[k]) gi[k] = avg;
+                float gF = (gi[0] + gi[1]) * 0.5f, gB = (gi[2] + gi[3]) * 0.5f;
+                float gRt = (gi[1] + gi[3]) * 0.5f, gL = (gi[0] + gi[2]) * 0.5f;
+                float tp = atan2f(gF - gB, 2.0f * wzs), tr = atan2f(gRt - gL, 2.0f * wxs);
+                float target = (gi[0] + gi[1] + gi[2] + gi[3]) * 0.25f;
+                for (int k = 0; k < 4; k++) {
+                    float zf = (k & 2) ? -wzs : wzs;
+                    float xr = (k & 1) ? wxs : -wxs;
+                    float pred = target + zf * tanf(tp) + xr * tanf(tr);
+                    if (gi[k] > pred) target += gi[k] - pred;
+                }
+                if (target > py) py = target; else py += (target - py) * 0.35f;
+                pitch += (tp - pitch) * 0.25f;
+                roll  += (tr - roll) * 0.25f;
+            } else py -= 8.0f * u * dt;
         }
 
         float dh = heading - camHead;
@@ -1143,14 +1508,28 @@ int main(void) {
         ScePspFVector3 eye    = { px - cfx * 2.4f * u, py + 0.95f * u, pz - cfz * 2.4f * u };
         ScePspFVector3 center = { px + cfx * 0.8f * u, py + 0.40f * u, pz + cfz * 0.8f * u };
         ScePspFVector3 up     = { 0.0f, 1.0f, 0.0f };
-        float nearp = fmaxf(0.05f * u, 0.01f), farp = fmaxf(trackExt * 1.2f, 100.0f * u);
+        float nearp = fmaxf(0.05f * u, 0.01f), farp = fmaxf(g_trackExt * 1.2f, 100.0f * u);
 
         sceGuStart(GU_DIRECT, list);
         sceGuTexScale(1.0f, 1.0f);
         sceGuTexOffset(0.0f, 0.0f);
+        sceGuEnable(GU_DEPTH_TEST);
         sceGuClearColor(0xFFE0B080);
         sceGuClearDepth(0);
         sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+
+#if USE_LIGHTING
+        {
+            ScePspFVector3 ld = { 0.35f, 0.85f, 0.40f };      /* direcao PARA a luz (sol alto, atras-direita) */
+            sceGuEnable(GU_LIGHTING);
+            sceGuEnable(GU_LIGHT0);
+            sceGuColorMaterial(GU_AMBIENT | GU_DIFFUSE);
+            sceGuAmbient(0xFF606060);
+            sceGuLightMode(GU_SINGLE_COLOR);
+            sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE, &ld);
+            sceGuLightColor(0, GU_DIFFUSE, 0xFFFFFFFF);
+        }
+#endif
 
         sceGumMatrixMode(GU_PROJECTION);
         sceGumLoadIdentity();
@@ -1163,22 +1542,22 @@ int main(void) {
         sceGumLoadIdentity();
         draw_model(&g_track);
 
-        float ry = py + 0.01f * u;                 /* pequena folga para nao brigar com o asfalto */
+        float ry = py + 0.004f * u;
         car_base(px, ry, pz, heading, pitch, roll, carScale);
-        sceGumRotateY(carYaw0 + (flip ? PI_F : 0.0f));
+        sceGumRotateY(g_carYaw0 + (flip ? PI_F : 0.0f));
         draw_model(&g_car);
 
-        if (haveWheel) {
+        if (g_nwv) {
             for (int k = 0; k < 4; k++) {
-                float sxw = (k & 1) ? wx : -wx;
-                float szw = (k & 2) ? wz : -wz;       /* k<2: frente (-Z) */
-                ScePspFVector3 wp = { sxw, wheelR, szw };
+                float sxw = (k & 1) ? g_wx : -g_wx;
+                float szw = (k & 2) ? g_wz : -g_wz;
+                ScePspFVector3 wp = { sxw, wR, szw };
                 car_base(px, ry, pz, heading, pitch, roll, carScale);
                 sceGumTranslate(&wp);
                 if (k < 2) sceGumRotateY(-steerVis * 0.5f);
                 sceGumRotateX(wheelRot);
                 if (WHEEL_MIRROR && sxw < 0) sceGumRotateY(PI_F);
-                draw_model(&g_wheel);
+                draw_model(&g_wv[g_wsel]);
             }
         }
 
