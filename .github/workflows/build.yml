@@ -1,0 +1,26 @@
+name: Build PSP EBOOT
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: pspdev/pspdev:latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compilar
+        run: make
+
+      - name: Enviar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: EBOOT
+          path: EBOOT.PBP
+          if-no-files-found: error
