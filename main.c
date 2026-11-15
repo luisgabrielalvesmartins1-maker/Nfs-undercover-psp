@@ -6,6 +6,7 @@
 #include <pspgum.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
@@ -22,7 +23,10 @@ PSP_HEAP_SIZE_KB(16 * 1024);
 #define LOG_PATH   BASE_DIR "/log.txt"
 #define CAR_FILE   "car_viper.m3g"
 #define TRACK_FILE "causeway.m3g"
-#define CAR_SCALE  1.0f     /* L/R ajustam em tempo real; depois fixe aqui */
+#define WHEEL_FILE ""        /* "" = procura sozinho em assets/ (nome com wheel/tire/tyre/rim) */
+#define CAR_SCALE  1.0f      /* L/R ajustam em tempo real; depois fixe aqui */
+#define WHEEL_MIRROR 1       /* 1 = gira 180 graus as rodas do lado esquerdo; troque se o aro ficar pra dentro */
+#define FLIP_V     0         /* 1 = inverte o V das texturas (se vierem de cabeca para baixo) */
 
 #define BUF_WIDTH  512
 #define SCR_WIDTH  480
@@ -34,7 +38,18 @@ static unsigned int __attribute__((aligned(16))) list[262144];
 static FILE *g_log;
 #define LOG(...) do { if (g_log) fprintf(g_log, __VA_ARGS__); } while (0)
 
-/* ======================= Leitor binário (M3G = little-endian) ======================= */
+static char g_diag[2048];
+static void diag(const char *fmt, ...) {
+    char line[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    LOG("%s\n", line);
+    if (strlen(g_diag) + strlen(line) + 2 < sizeof g_diag) { strcat(g_diag, line); strcat(g_diag, "\n"); }
+}
+
+/* ======================= Leitor binario (M3G = little-endian) ======================= */
 typedef struct { const uint8_t *p, *e; int bad; } Rd;
 
 static uint8_t rd8(Rd *r) { if (r->p >= r->e) { r->bad = 1; return 0; } return *r->p++; }
@@ -50,9 +65,9 @@ typedef struct { uint8_t type; const uint8_t *data; uint32_t len; } Obj;
 typedef struct { int count, comps, size; int16_t *v; } VArr;
 
 typedef struct {
-    Obj *obj; int nobj, cap;     /* nobj = próximo índice (objetos começam em 1) */
+    Obj *obj; int nobj, cap;
     VArr *va;
-    int *timg;                   /* índice de Image2D/ref externa -> textura global (-2 = não tentado) */
+    int *timg;
     int ntexobj, fallback;
     char base[64];
 } M3G;
@@ -65,22 +80,24 @@ typedef struct {
     Vertex *v; int nv, capv;
     Batch *b; int nb, capb;
     float mn[3], mx[3];
+    int nsub, nuv, ntexobj, nimg, next;
 } Model;
 
 typedef struct { void *data; int w, h, alpha; char name[64]; } Tex;
 #define MAX_TEX 128
 static Tex g_tex[MAX_TEX];
 static int g_ntex;
+static char g_miss[6][48];
+static int g_nmiss;
 
-static M3G *M;        /* arquivo sendo processado */
-static Model *OUT;    /* modelo sendo preenchido */
+static M3G *M;
+static Model *OUT;
 static int g_sub, g_honor;
-static Model g_car, g_track;
+static Model g_car, g_track, g_wheel;
 
 /* ======================= Texturas ======================= */
 static int p2(int v, int cap) { int p = 8; while (p < v && p < cap) p <<= 1; return p; }
 
-/* rgba = bytes R,G,B,A. Reamostra (vizinho mais próximo) para potência de 2, máx. 256 */
 static int tex_create(const uint8_t *rgba, int w, int h, const char *name) {
     if (g_ntex >= MAX_TEX || w <= 0 || h <= 0) return -1;
     int pw = p2(w, 256), ph = p2(h, 256);
@@ -158,53 +175,68 @@ static int tex_from_png_file(const char *fname) {
     snprintf(path, sizeof path, "%s/%s", ASSET_DIR, fname);
     int w, h;
     uint8_t *px = load_png(path, &w, &h);
-    if (!px) { LOG("png nao carregado: %s\n", path); return -1; }
+    if (!px) {
+        LOG("png nao carregado: %s\n", path);
+        if (g_nmiss < 6) snprintf(g_miss[g_nmiss++], sizeof g_miss[0], "%s", fname);
+        return -1;
+    }
     int id = tex_create(px, w, h, low);
     free(px);
     return id;
 }
 
-/* procura em assets/ um .png cujo nome contenha 'base' (prefere nome exato) */
+static const char *BAD[] = { "wheel", "tire", "tyre", "glass", "shadow", "icon", "thumb", "menu", "logo", "light", "small" };
+
+/* melhor .png de assets/ cujo nome contem 'base' (ou o trecho depois do 1o '_') */
 static int find_png(const char *base, char *out, size_t osz) {
-    char want[64];
-    lower(want, base, sizeof want);
+    char b[64], alt[64] = "";
+    lower(b, base, sizeof b);
+    const char *u = strchr(b, '_');
+    if (u && u[1]) snprintf(alt, sizeof alt, "%s", u + 1);
     SceUID d = sceIoDopen(ASSET_DIR);
     if (d < 0) return 0;
     SceIoDirent e;
-    int found = 0;
+    int best = 0;
     for (;;) {
         memset(&e, 0, sizeof e);
         if (sceIoDread(d, &e) <= 0) break;
         char low[256];
         lower(low, e.d_name, sizeof low);
         size_t n = strlen(low);
-        if (n > 4 && !strcmp(low + n - 4, ".png") && strstr(low, want)) {
-            int exact = (n == strlen(want) + 4);
-            if (!found || exact) { snprintf(out, osz, "%s", e.d_name); found = 1; }
-            if (exact) break;
-        }
+        if (n <= 4 || strcmp(low + n - 4, ".png")) continue;
+        int hb = strstr(low, b) != NULL;
+        int ha = alt[0] && strstr(low, alt) != NULL;
+        if (!hb && !ha) continue;
+        char ex[80];
+        snprintf(ex, sizeof ex, "%s.png", b);
+        int s = 1;
+        if (!strcmp(low, ex)) s += 100;
+        if (hb) s += 50;
+        if (ha) s += 30;
+        for (unsigned i = 0; i < sizeof BAD / sizeof BAD[0]; i++)
+            if (strstr(low, BAD[i]) && !strstr(b, BAD[i])) s -= 40;
+        s -= (int)n / 16;
+        if (s > best) { best = s; snprintf(out, osz, "%s", e.d_name); }
     }
     sceIoDclose(d);
-    return found;
+    return best > 0;
 }
 
 static int fallback_tex(void) {
     if (M->fallback != -2) return M->fallback;
     char file[256];
     int id = -1;
-    const char *alt = strchr(M->base, '_');
-    if (find_png(M->base, file, sizeof file) || (alt && find_png(alt + 1, file, sizeof file)))
-        id = tex_from_png_file(file);
+    if (find_png(M->base, file, sizeof file)) id = tex_from_png_file(file);
     LOG("fallback de textura por nome (%s): %s\n", M->base, id >= 0 ? file : "(nenhum png encontrado)");
     M->fallback = id;
     return id;
 }
 
-/* Image2D embutida: 96=A 97=L 98=LA 99=RGB 100=RGBA; pode ter paleta */
 static int tex_from_image2d(const Obj *o, uint32_t idx) {
     Rd r = { o->data, o->data + o->len, 0 };
-    rd32(&r); { uint32_t n = rd32(&r); if (n > 0x10000) return -1; rdskip(&r, n * 4);
-                n = rd32(&r); while (n-- && !r.bad) { rd32(&r); uint32_t l = rd32(&r); rdskip(&r, l); } }
+    rd32(&r);
+    { uint32_t n = rd32(&r); if (n > 0x10000) return -1; rdskip(&r, n * 4);
+      n = rd32(&r); while (n-- && !r.bad) { rd32(&r); uint32_t l = rd32(&r); rdskip(&r, l); } }
     int fmt = rd8(&r), mut = rd8(&r);
     uint32_t w = rd32(&r), h = rd32(&r);
     if (r.bad || mut || w == 0 || h == 0 || w > 1024 || h > 1024) return -1;
@@ -216,7 +248,7 @@ static int tex_from_image2d(const Obj *o, uint32_t idx) {
     uint32_t xl = rd32(&r);
     const uint8_t *pix = r.p;
     if (r.bad || (uint32_t)(r.e - r.p) < xl) return -1;
-    uint32_t np = (uint32_t)w * h;
+    uint32_t np = w * h;
     if (pl ? xl < np : xl < np * bpp) return -1;
     uint8_t *rgba = malloc((size_t)np * 4);
     if (!rgba) return -1;
@@ -377,11 +409,11 @@ static int parse_vbuf(uint32_t idx, VBuf *vb) {
     if (idx == 0 || idx >= (uint32_t)M->nobj || M->obj[idx].type != 21) return 0;
     Rd r = { M->obj[idx].data, M->obj[idx].data + M->obj[idx].len, 0 };
     parse_object3d(&r);
-    rd32(&r);                                   /* cor padrão */
+    rd32(&r);
     uint32_t pi = rd32(&r);
     for (int i = 0; i < 3; i++) vb->bias[i] = rdf(&r);
     vb->scale = rdf(&r);
-    rd32(&r);                                   /* normais */
+    rd32(&r);
     uint32_t ci = rd32(&r);
     uint32_t nt = rd32(&r);
     vb->uv = NULL; vb->uscale = 1.0f; vb->ubias[0] = vb->ubias[1] = vb->ubias[2] = 0;
@@ -398,19 +430,18 @@ static int parse_vbuf(uint32_t idx, VBuf *vb) {
     return 1;
 }
 
-/* Appearance -> Texture2D -> Image2D / referência externa */
 static int texture2d_tex(uint32_t ti, int *wrap) {
     if (ti == 0 || ti >= (uint32_t)M->nobj || M->obj[ti].type != 17) return -1;
     Rd r = { M->obj[ti].data, M->obj[ti].data + M->obj[ti].len, 0 };
     parse_object3d(&r);
-    if (rd8(&r)) rdskip(&r, 40);                /* componentes: 3+3+1+3 floats */
-    if (rd8(&r)) rdskip(&r, 64);                /* matriz geral */
+    if (rd8(&r)) rdskip(&r, 40);
+    if (rd8(&r)) rdskip(&r, 64);
     uint32_t img = rd32(&r);
-    rdskip(&r, 3);                              /* blend color */
-    rd8(&r);                                    /* blending */
+    rdskip(&r, 3);
+    rd8(&r);
     int ws = rd8(&r);
     if (r.bad) return -1;
-    *wrap = (ws == 241);                        /* 241 = repeat, 240 = clamp */
+    *wrap = (ws == 241);
     return image_tex(img);
 }
 
@@ -420,12 +451,15 @@ static int appearance_tex(uint32_t app, int *wrap, int hasuv) {
     if (app > 0 && app < (uint32_t)M->nobj && M->obj[app].type == 3) {
         Rd r = { M->obj[app].data, M->obj[app].data + M->obj[app].len, 0 };
         parse_object3d(&r);
-        rd8(&r);                                /* layer */
-        for (int i = 0; i < 4; i++) rd32(&r);   /* compositing, fog, polygon, material */
+        rd8(&r);
+        for (int i = 0; i < 4; i++) rd32(&r);
         uint32_t nt = rd32(&r);
-        if (!r.bad && nt > 0) return texture2d_tex(rd32(&r), wrap);
+        if (!r.bad && nt > 0) {
+            int tx = texture2d_tex(rd32(&r), wrap);
+            return tx >= 0 ? tx : fallback_tex();   /* referencia nao resolvida -> tenta pelo nome */
+        }
     }
-    if (M->ntexobj == 0) return fallback_tex(); /* arquivo sem Texture2D: tenta o png pelo nome */
+    if (M->ntexobj == 0) return fallback_tex();
     return -1;
 }
 
@@ -480,8 +514,8 @@ static void parse_transformable(Rd *r, float *m) {
 static void parse_node(Rd *r, float *m, int *enabled) {
     parse_object3d(r);
     parse_transformable(r, m);
-    *enabled = rd8(r) != 0;                     /* enableRendering */
-    rd8(r); rd8(r); rd32(r);                    /* picking, alpha, scope */
+    *enabled = rd8(r) != 0;
+    rd8(r); rd8(r); rd32(r);
     if (rd8(r)) { rd8(r); rd8(r); rd32(r); rd32(r); }
 }
 
@@ -553,6 +587,7 @@ static void add_tri(const VBuf *vb, const float *world, const uint32_t id[3], in
             const int16_t *t = vb->uv->v + id[i] * vb->uv->comps;
             o->u = t[0] * vb->uscale + vb->ubias[0];
             o->v = t[1] * vb->uscale + vb->ubias[1];
+            if (FLIP_V) o->v = 1.0f - o->v;
         }
         o->color = 0xFF000000u | ((uint32_t)(b * shade) << 16) | ((uint32_t)(g * shade) << 8) | (uint32_t)(r * shade);
         o->x = P[i][0]; o->y = P[i][1]; o->z = P[i][2];
@@ -612,7 +647,7 @@ static void visit(int idx, const float *parent, int depth) {
     float local[16], world[16];
     int en;
     parse_node(&r, local, &en);
-    if (!en && g_honor) return;                 /* nó oculto (ex.: colisão) */
+    if (!en && g_honor) return;
     mat_mul(world, parent, local);
     if (t == 9 || t == 22) {
         uint32_t n = rd32(&r);
@@ -620,14 +655,24 @@ static void visit(int idx, const float *parent, int depth) {
     } else {
         uint32_t vbi = rd32(&r), ns = rd32(&r);
         VBuf vb;
-        if (r.bad || !parse_vbuf(vbi, &vb)) return;
+        if (r.bad || !parse_vbuf(vbi, &vb)) { LOG("  malha obj=%d IGNORADA (vertex buffer invalido)\n", idx); return; }
         for (uint32_t k = 0; k < ns && !r.bad; k++) {
             uint32_t ib = rd32(&r), app = rd32(&r);
             int wrap, tex = appearance_tex(app, &wrap, vb.uv != NULL);
             int start = OUT->nv;
             emit_strips(&vb, ib, world, g_sub, tex);
             add_batch(start, tex, wrap);
-            LOG("  malha obj=%d sub=%d tris=%d tex=%d\n", idx, g_sub, (OUT->nv - start) / 3, tex);
+            OUT->nsub++;
+            if (vb.uv) OUT->nuv++;
+            if (OUT->nv > start) {
+                float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+                for (int i = start; i < OUT->nv; i++) {
+                    float p[3] = { OUT->v[i].x, OUT->v[i].y, OUT->v[i].z };
+                    for (int q = 0; q < 3; q++) { if (p[q] < mn[q]) mn[q] = p[q]; if (p[q] > mx[q]) mx[q] = p[q]; }
+                }
+                LOG("  malha obj=%d sub=%d tris=%d uv=%d tex=%d bbox[%.2f %.2f %.2f]-[%.2f %.2f %.2f]\n",
+                    idx, g_sub, (OUT->nv - start) / 3, vb.uv != NULL, tex, mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]);
+            }
             g_sub++;
         }
     }
@@ -653,6 +698,7 @@ static const char *load_model(const char *file, Model *out, int honorHidden) {
     memset(cnt, 0, sizeof cnt);
     for (int i = 1; i < m.nobj; i++) cnt[m.obj[i].type]++;
     m.ntexobj = cnt[17];
+    out->ntexobj = cnt[17]; out->nimg = cnt[10]; out->next = cnt[255];
     LOG("objetos: Mesh=%d Skinned=%d Morph=%d Group=%d World=%d Appearance=%d Texture2D=%d Image2D=%d ExtRef=%d VertexArray=%d\n",
         cnt[14], cnt[16], cnt[15], cnt[9], cnt[22], cnt[3], cnt[17], cnt[10], cnt[255], cnt[20]);
 
@@ -663,7 +709,7 @@ static const char *load_model(const char *file, Model *out, int honorHidden) {
     for (int i = 0; i < m.nobj; i++) m.timg[i] = -2;
     for (int i = 1; i < m.nobj; i++) if (m.obj[i].type == 20) parse_vertex_array(i);
 
-    for (int i = 1; i < m.nobj; i++) {          /* acha os nós raiz */
+    for (int i = 1; i < m.nobj; i++) {
         if (m.obj[i].type != 9 && m.obj[i].type != 22) continue;
         Rd r = { m.obj[i].data, m.obj[i].data + m.obj[i].len, 0 };
         float tmp[16]; int en;
@@ -686,9 +732,67 @@ static const char *load_model(const char *file, Model *out, int honorHidden) {
     return NULL;
 }
 
-/* ======================= Terreno: grade para altura do chão ======================= */
+/* ======================= Rodas: acha o arquivo e prepara o modelo ======================= */
+static int find_wheel_file(const char *carbase, char *out, size_t osz) {
+    char b[64], alt[64] = "";
+    lower(b, carbase, sizeof b);
+    const char *u = strchr(b, '_');
+    if (u && u[1]) snprintf(alt, sizeof alt, "%s", u + 1);
+    SceUID d = sceIoDopen(ASSET_DIR);
+    if (d < 0) return 0;
+    SceIoDirent e;
+    int best = -9999, found = 0;
+    for (;;) {
+        memset(&e, 0, sizeof e);
+        if (sceIoDread(d, &e) <= 0) break;
+        char low[256];
+        lower(low, e.d_name, sizeof low);
+        size_t n = strlen(low);
+        if (n <= 4 || strcmp(low + n - 4, ".m3g")) continue;
+        if (!strstr(low, "wheel") && !strstr(low, "tire") && !strstr(low, "tyre") && !strstr(low, "rim")) continue;
+        int s = 10 - (int)n / 16;
+        if (alt[0] && strstr(low, alt)) s += 50;
+        if (strstr(low, b)) s += 20;
+        LOG("candidato de roda: %s (pontos %d)\n", e.d_name, s);
+        if (s > best) { best = s; snprintf(out, osz, "%s", e.d_name); found = 1; }
+    }
+    sceIoDclose(d);
+    return found;
+}
+
+/* centra a roda, alinha o eixo com X, ajusta a escala se estiver absurda; devolve raio e meia-largura */
+static void wheel_prepare(float carLen, float *R, float *halfW) {
+    Model *w = &g_wheel;
+    float ext[3] = { w->mx[0] - w->mn[0], w->mx[1] - w->mn[1], w->mx[2] - w->mn[2] };
+    float c[3] = { (w->mn[0] + w->mx[0]) * 0.5f, (w->mn[1] + w->mx[1]) * 0.5f, (w->mn[2] + w->mx[2]) * 0.5f };
+    int ax = 0;
+    if (ext[1] < ext[ax]) ax = 1;
+    if (ext[2] < ext[ax]) ax = 2;                    /* eixo da roda = dimensao mais fina */
+    float diam = fmaxf(ext[(ax + 1) % 3], ext[(ax + 2) % 3]);
+    float ratio = diam / carLen;
+    float s = (ratio < 0.08f || ratio > 0.30f) ? (0.16f * carLen / diam) : 1.0f;
+    for (int i = 0; i < w->nv; i++) {
+        float x = w->v[i].x - c[0], y = w->v[i].y - c[1], z = w->v[i].z - c[2], t;
+        if (ax == 2)      { t = z; z = -x; x = t; }  /* eixo Z -> X */
+        else if (ax == 1) { t = -y; y = x; x = t; }  /* eixo Y -> X */
+        w->v[i].x = x * s; w->v[i].y = y * s; w->v[i].z = z * s;
+    }
+    *R = diam * s * 0.5f;
+    *halfW = ext[ax] * s * 0.5f;
+    LOG("roda: eixo=%d diametro=%.2f largura=%.2f escala aplicada=%.3f\n", ax, diam, ext[ax], s);
+}
+
+/* ======================= Terreno ======================= */
 typedef struct { int ok, nx, nz; float x0, z0, cs; int *start, *list; } Grid;
 static Grid g_grid;
+
+static float tri_ny(const Vertex *v) {
+    float ax = v[1].x - v[0].x, ay = v[1].y - v[0].y, az = v[1].z - v[0].z;
+    float bx = v[2].x - v[0].x, by = v[2].y - v[0].y, bz = v[2].z - v[0].z;
+    float nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
+    float len = sqrtf(nx * nx + ny * ny + nz * nz);
+    return len < 1e-12f ? 0.0f : fabsf(ny) / len;
+}
 
 static int grid_build(Grid *g, const Model *t) {
     float ex = t->mx[0] - t->mn[0], ez = t->mx[2] - t->mn[2];
@@ -696,24 +800,31 @@ static int grid_build(Grid *g, const Model *t) {
     g->cs = ext / 128.0f; if (g->cs <= 0) g->cs = 1.0f;
     g->x0 = t->mn[0]; g->z0 = t->mn[2];
     g->nx = (int)(ex / g->cs) + 1; g->nz = (int)(ez / g->cs) + 1;
-    int nc = g->nx * g->nz, ntri = t->nv / 3;
+    int nc = g->nx * g->nz;
     g->start = calloc(nc + 1, sizeof(int));
     if (!g->start) return 0;
     int *fill = NULL;
     for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < ntri; i++) {
-            const Vertex *v = &t->v[i * 3];
-            float minx = fminf(v[0].x, fminf(v[1].x, v[2].x)), maxx = fmaxf(v[0].x, fmaxf(v[1].x, v[2].x));
-            float minz = fminf(v[0].z, fminf(v[1].z, v[2].z)), maxz = fmaxf(v[0].z, fmaxf(v[1].z, v[2].z));
-            int ix0 = (int)((minx - g->x0) / g->cs), ix1 = (int)((maxx - g->x0) / g->cs);
-            int iz0 = (int)((minz - g->z0) / g->cs), iz1 = (int)((maxz - g->z0) / g->cs);
-            if (ix0 < 0) ix0 = 0; if (iz0 < 0) iz0 = 0;
-            if (ix1 >= g->nx) ix1 = g->nx - 1; if (iz1 >= g->nz) iz1 = g->nz - 1;
-            for (int iz = iz0; iz <= iz1; iz++)
-                for (int ix = ix0; ix <= ix1; ix++) {
-                    int c = iz * g->nx + ix;
-                    if (pass == 0) g->start[c + 1]++; else g->list[fill[c]++] = i;
-                }
+        for (int bi = 0; bi < t->nb; bi++) {
+            const Batch *bt = &t->b[bi];
+            if (bt->tex >= 0 && g_tex[bt->tex].alpha) continue;       /* folhas/grades nao sao chao */
+            int t0 = bt->start / 3, t1 = (bt->start + bt->count) / 3;
+            for (int i = t0; i < t1; i++) {
+                const Vertex *v = &t->v[i * 3];
+                float minx = fminf(v[0].x, fminf(v[1].x, v[2].x)), maxx = fmaxf(v[0].x, fmaxf(v[1].x, v[2].x));
+                float minz = fminf(v[0].z, fminf(v[1].z, v[2].z)), maxz = fmaxf(v[0].z, fmaxf(v[1].z, v[2].z));
+                int ix0 = (int)((minx - g->x0) / g->cs), ix1 = (int)((maxx - g->x0) / g->cs);
+                int iz0 = (int)((minz - g->z0) / g->cs), iz1 = (int)((maxz - g->z0) / g->cs);
+                if (ix0 < 0) ix0 = 0;
+                if (iz0 < 0) iz0 = 0;
+                if (ix1 >= g->nx) ix1 = g->nx - 1;
+                if (iz1 >= g->nz) iz1 = g->nz - 1;
+                for (int iz = iz0; iz <= iz1; iz++)
+                    for (int ix = ix0; ix <= ix1; ix++) {
+                        int c = iz * g->nx + ix;
+                        if (pass == 0) g->start[c + 1]++; else g->list[fill[c]++] = i;
+                    }
+            }
         }
         if (pass == 0) {
             for (int c = 0; c < nc; c++) g->start[c + 1] += g->start[c];
@@ -728,7 +839,7 @@ static int grid_build(Grid *g, const Model *t) {
     return 1;
 }
 
-/* altura do chão em (x,z). lowest=1: menor superfície; senão a mais alta abaixo de maxY */
+/* lowest=1: menor superficie; senao a mais alta com y <= maxY */
 static int ground_at(float x, float z, float maxY, int lowest, float *outY) {
     const Grid *g = &g_grid;
     if (!g->ok) return 0;
@@ -745,11 +856,7 @@ static int ground_at(float x, float z, float maxY, int lowest, float *outY) {
         float l2 = ((z3 - z1) * (x - x3) + (x1 - x3) * (z - z3)) / den;
         float l3 = 1.0f - l1 - l2;
         if (l1 < -1e-4f || l2 < -1e-4f || l3 < -1e-4f) continue;
-        float ax = v[1].x - v[0].x, ay = v[1].y - v[0].y, az = v[1].z - v[0].z;
-        float bx = v[2].x - v[0].x, by = v[2].y - v[0].y, bz = v[2].z - v[0].z;
-        float nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
-        float len = sqrtf(nx * nx + ny * ny + nz * nz);
-        if (len < 1e-12f || fabsf(ny) / len < 0.35f) continue;     /* ignora paredes */
+        if (tri_ny(v) < 0.35f) continue;
         float y = l1 * v[0].y + l2 * v[1].y + l3 * v[2].y;
         if (lowest) { if (!found || y < best) { best = y; found = 1; } }
         else if (y <= maxY && (!found || y > best)) { best = y; found = 1; }
@@ -758,17 +865,47 @@ static int ground_at(float x, float z, float maxY, int lowest, float *outY) {
     return found;
 }
 
-static void find_start(float *sx, float *sy, float *sz) {
+static int is_road(const char *n) {
+    static const char *k[] = { "road", "asph", "tarm", "street", "track", "bridge", "deck", "pave", "lane", "highway", "hwy", "race" };
+    for (unsigned i = 0; i < sizeof k / sizeof k[0]; i++) if (strstr(n, k[i])) return 1;
+    return 0;
+}
+
+/* inicio: 1) triangulo com textura de "estrada" mais perto do centro; 2) espiral, superficie mais ALTA */
+static void find_start(float u, float *sx, float *sy, float *sz, char *how, size_t hsz) {
     float cx = (g_track.mn[0] + g_track.mx[0]) * 0.5f, cz = (g_track.mn[2] + g_track.mx[2]) * 0.5f;
     *sx = cx; *sy = g_track.mx[1]; *sz = cz;
+    snprintf(how, hsz, "centro (sem grade de chao)");
     if (!g_grid.ok) return;
+
+    float bestd = 1e30f, bx = 0, by = 0, bz = 0;
+    int have = 0;
+    const char *bn = "";
+    for (int bi = 0; bi < g_track.nb; bi++) {
+        const Batch *b = &g_track.b[bi];
+        if (b->tex < 0 || g_tex[b->tex].alpha || !is_road(g_tex[b->tex].name)) continue;
+        for (int i = b->start; i + 2 < b->start + b->count; i += 3) {
+            const Vertex *v = &g_track.v[i];
+            if (tri_ny(v) < 0.6f) continue;
+            float tx = (v[0].x + v[1].x + v[2].x) / 3.0f, tz = (v[0].z + v[1].z + v[2].z) / 3.0f;
+            float d = (tx - cx) * (tx - cx) + (tz - cz) * (tz - cz);
+            if (d < bestd) { bestd = d; bx = tx; bz = tz; by = (v[0].y + v[1].y + v[2].y) / 3.0f; have = 1; bn = g_tex[b->tex].name; }
+        }
+    }
+    if (have) {
+        float y;
+        if (!ground_at(bx, bz, by + 1.0f * u, 0, &y)) y = by;
+        *sx = bx; *sy = y; *sz = bz;
+        snprintf(how, hsz, "textura '%.30s'", bn);
+        return;
+    }
     float step = g_grid.cs * 2.0f;
     for (int ring = 0; ring < 64; ring++) {
         int n = ring ? ring * 8 : 1;
         for (int k = 0; k < n; k++) {
             float a = 6.2831853f * k / n;
             float x = cx + cosf(a) * ring * step, z = cz + sinf(a) * ring * step, y;
-            if (ground_at(x, z, 0, 1, &y)) { *sx = x; *sy = y; *sz = z; return; }
+            if (ground_at(x, z, 1e9f, 0, &y)) { *sx = x; *sy = y; *sz = z; snprintf(how, hsz, "espiral (mais alta)"); return; }
         }
     }
 }
@@ -786,7 +923,7 @@ static void setup_callbacks(void) {
     if (thid >= 0) sceKernelStartThread(thid, 0, NULL);
 }
 
-/* ======================= Gráficos ======================= */
+/* ======================= Graficos ======================= */
 static void init_gu(void) {
     sceGuInit();
     sceGuStart(GU_DIRECT, list);
@@ -802,6 +939,8 @@ static void init_gu(void) {
     sceGuEnable(GU_DEPTH_TEST);
     sceGuShadeModel(GU_SMOOTH);
     sceGuDisable(GU_CULL_FACE);
+    sceGuTexScale(1.0f, 1.0f);       /* sem isso a escala de UV pode ficar 0 e a textura vira cor solida */
+    sceGuTexOffset(0.0f, 0.0f);
     sceGuFinish();
     sceGuSync(0, 0);
     sceDisplayWaitVblankStart();
@@ -834,6 +973,22 @@ static void draw_model(const Model *md) {
     }
 }
 
+static void car_base(float px, float py, float pz, float heading, float pitch, float roll, float scale) {
+    ScePspFVector3 pos = { px, py, pz }, sc = { scale, scale, scale };
+    sceGumLoadIdentity();
+    sceGumTranslate(&pos);
+    sceGumRotateY(-heading);
+    sceGumRotateX(pitch);
+    sceGumRotateZ(roll);
+    sceGumScale(&sc);
+}
+
+static int count_tex_batches(const Model *m) {
+    int n = 0;
+    for (int i = 0; i < m->nb; i++) if (m->b[i].tex >= 0) n++;
+    return n;
+}
+
 static void fatal(const char *what, const char *err) {
     LOG("ERRO (%s): %s\n", what, err);
     if (g_log) { fclose(g_log); g_log = NULL; }
@@ -845,39 +1000,83 @@ static void fatal(const char *what, const char *err) {
 /* ======================= Programa ======================= */
 int main(void) {
     setup_callbacks();
+    sceCtrlSetSamplingCycle(0);
+    sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
     g_log = fopen(LOG_PATH, "w");
 
-    const char *err = load_model(CAR_FILE, &g_car, 0);       /* carro: desenha tudo (rodas incluídas) */
+    const char *err = load_model(CAR_FILE, &g_car, 0);
     if (err) { fatal(CAR_FILE, err); return 0; }
-    err = load_model(TRACK_FILE, &g_track, 1);                /* pista: respeita nós ocultos */
+    err = load_model(TRACK_FILE, &g_track, 1);
     if (err) { fatal(TRACK_FILE, err); return 0; }
+
+    /* rodas: arquivo separado (se existir) */
+    char stem[64], wfile[256] = "";
+    snprintf(stem, sizeof stem, "%s", CAR_FILE);
+    { char *d = strrchr(stem, '.'); if (d) *d = 0; }
+    if (WHEEL_FILE[0]) snprintf(wfile, sizeof wfile, "%s", WHEEL_FILE);
+    else find_wheel_file(stem, wfile, sizeof wfile);
+    int haveWheel = 0;
+    char wmsg[96] = "nenhum arquivo de roda em assets/";
+    if (wfile[0]) {
+        const char *we = load_model(wfile, &g_wheel, 0);
+        if (we) snprintf(wmsg, sizeof wmsg, "%.30s: %.40s", wfile, we);
+        else { haveWheel = 1; snprintf(wmsg, sizeof wmsg, "%.40s (%d tris)", wfile, g_wheel.nv / 3); }
+    }
 
     /* carro: origem no centro da base */
     float ex = g_car.mx[0] - g_car.mn[0], ez = g_car.mx[2] - g_car.mn[2], ey = g_car.mx[1] - g_car.mn[1];
     float cx = (g_car.mn[0] + g_car.mx[0]) * 0.5f, cz = (g_car.mn[2] + g_car.mx[2]) * 0.5f, by = g_car.mn[1];
-    for (int i = 0; i < g_car.nv; i++) { g_car.v[i].x -= cx; g_car.v[i].y -= by; g_car.v[i].z -= cz; }
-    float carLen = ex > ez ? ex : ez;
-    float carYaw0 = (ex > ez) ? PI_F * 0.5f : 0.0f;           /* frente ao longo de X -> gira p/ -Z */
-    float tex_ = g_track.mx[0] - g_track.mn[0], tez = g_track.mx[2] - g_track.mn[2], tey = g_track.mx[1] - g_track.mn[1];
-    float trackExt = fmaxf(tex_, fmaxf(tez, tey));
-    LOG("carro: %.2f x %.2f x %.2f (comprimento %.2f)\n", ex, ey, ez, carLen);
-    LOG("pista: %.1f x %.1f x %.1f  x[%.1f..%.1f] z[%.1f..%.1f]\n", tex_, tey, tez,
-        g_track.mn[0], g_track.mx[0], g_track.mn[2], g_track.mx[2]);
+    float carLen = ex > ez ? ex : ez, carW = ex > ez ? ez : ex;
+    float carYaw0 = (ex > ez) ? PI_F * 0.5f : 0.0f;
+
+    float wheelR = 0, wheelHW = 0;
+    if (haveWheel) wheel_prepare(carLen, &wheelR, &wheelHW);
+    float lift = haveWheel ? 0.28f * wheelR : 0.02f * carLen;     /* folga entre a base do carro e o chao */
+    for (int i = 0; i < g_car.nv; i++) { g_car.v[i].x -= cx; g_car.v[i].y += lift - by; g_car.v[i].z -= cz; }
+
+    float wx = carW * 0.5f - wheelHW;
+    if (wx < 0.2f * carW) wx = 0.2f * carW;
+    float wz = 0.29f * carLen;
+
+    float trkx = g_track.mx[0] - g_track.mn[0], trkz = g_track.mx[2] - g_track.mn[2], trky = g_track.mx[1] - g_track.mn[1];
+    float trackExt = fmaxf(trkx, fmaxf(trkz, trky));
 
     g_grid.ok = grid_build(&g_grid, &g_track);
     float sx, sy, sz;
-    find_start(&sx, &sy, &sz);
-    LOG("grade de chao: %s; inicio em (%.2f, %.2f, %.2f)\n", g_grid.ok ? "ok" : "FALHOU", sx, sy, sz);
+    char how[64];
+    find_start(carLen * CAR_SCALE, &sx, &sy, &sz, how, sizeof how);
+
+    /* tela de diagnostico */
+    diag("carro %.1fx%.1fx%.1f: %d tris, %d lotes (%d c/ textura)", ex, ey, ez, g_car.nv / 3, g_car.nb, count_tex_batches(&g_car));
+    diag("  submalhas=%d c/UV=%d | Texture2D=%d Image2D=%d ExtRef=%d", g_car.nsub, g_car.nuv, g_car.ntexobj, g_car.nimg, g_car.next);
+    diag("pista %.0fx%.0fx%.0f: %d tris, %d lotes (%d c/ textura)", trkx, trky, trkz, g_track.nv / 3, g_track.nb, count_tex_batches(&g_track));
+    diag("  submalhas=%d c/UV=%d | Texture2D=%d Image2D=%d ExtRef=%d", g_track.nsub, g_track.nuv, g_track.ntexobj, g_track.nimg, g_track.next);
+    diag("texturas carregadas: %d", g_ntex);
+    for (int i = 0; i < g_nmiss && i < 4; i++) diag("  png nao carregado: %.44s", g_miss[i]);
+    diag("rodas: %s", wmsg);
+    diag("chao: %s | inicio via %s", g_grid.ok ? "ok" : "FALHOU", how);
+    diag("inicio (%.1f, %.1f, %.1f)", sx, sy, sz);
     if (g_log) { fclose(g_log); g_log = NULL; }
 
     sceKernelDcacheWritebackAll();
+
+    pspDebugScreenInit();
+    pspDebugScreenPrintf("%s\nDetalhes em %s/log.txt\n\nPressione X para iniciar...\n", g_diag, BASE_DIR);
+    {
+        SceCtrlData p;
+        for (int t = 0; t < 900; t++) {
+            sceCtrlPeekBufferPositive(&p, 1);
+            if (p.Buttons & PSP_CTRL_CROSS) break;
+            sceKernelDelayThread(16667);
+        }
+    }
+
     init_gu();
-    sceCtrlSetSamplingCycle(0);
-    sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
     SceCtrlData pad;
     unsigned int prev = 0;
-    float carScale = CAR_SCALE, heading = 0, camHead = 0, speed = 0, pitch = 0;
+    float carScale = CAR_SCALE, heading = 0, camHead = 0, speed = 0, pitch = 0, roll = 0;
+    float steerVis = 0, wheelRot = 0;
     float px = sx, py = sy, pz = sz;
     int flip = 0;
     const float dt = 1.0f / 60.0f;
@@ -894,7 +1093,6 @@ int main(void) {
 
         float u = carLen * carScale;
 
-        /* aceleração / freio / ré */
         if (pad.Buttons & PSP_CTRL_CROSS) speed += 8.0f * u * dt;
         else if (pad.Buttons & PSP_CTRL_SQUARE) speed -= (speed > 0 ? 16.0f : 6.0f) * u * dt;
         else {
@@ -905,32 +1103,38 @@ int main(void) {
         if (speed > 16.0f * u) speed = 16.0f * u;
         if (speed < -5.0f * u) speed = -5.0f * u;
 
-        /* direção: analógico ou setas */
         float steer = ((int)pad.Lx - 128) / 128.0f;
         if (fabsf(steer) < 0.15f) steer = 0;
         if (pad.Buttons & PSP_CTRL_LEFT)  steer = -1.0f;
         if (pad.Buttons & PSP_CTRL_RIGHT) steer = 1.0f;
         float grip = speed / (3.0f * u);
-        if (grip > 1.0f) grip = 1.0f; if (grip < -1.0f) grip = -1.0f;
+        if (grip > 1.0f) grip = 1.0f;
+        if (grip < -1.0f) grip = -1.0f;
         heading += steer * 1.9f * grip * dt;
+        steerVis += (steer - steerVis) * 0.2f;
 
         float fx = sinf(heading), fz = -cosf(heading);
+        float rx = cosf(heading), rz = sinf(heading);
         px += fx * speed * dt;
         pz += fz * speed * dt;
+        if (haveWheel) wheelRot -= (speed * dt / carScale) / (wheelR > 0.001f ? wheelR : 1.0f);
 
-        /* segue o chão */
+        /* acompanha altura e inclinacao do chao */
         if (g_grid.ok) {
             float gy;
             if (ground_at(px, pz, py + 0.6f * u, 0, &gy)) py += (gy - py) * 0.4f;
             else py -= 8.0f * u * dt;
-            float d = 0.35f * u, yf, yr;
-            int okf = ground_at(px + fx * d, pz + fz * d, py + 0.6f * u, 0, &yf);
-            int okr = ground_at(px - fx * d, pz - fz * d, py + 0.6f * u, 0, &yr);
-            float tp = (okf && okr) ? atan2f(yf - yr, 2.0f * d) : 0.0f;
+            float d = 0.35f * u, yf, yr, yR, yL;
+            float tp = 0, tr = 0;
+            if (ground_at(px + fx * d, pz + fz * d, py + 0.6f * u, 0, &yf) &&
+                ground_at(px - fx * d, pz - fz * d, py + 0.6f * u, 0, &yr)) tp = atan2f(yf - yr, 2.0f * d);
+            float d2 = 0.2f * u;
+            if (ground_at(px + rx * d2, pz + rz * d2, py + 0.6f * u, 0, &yR) &&
+                ground_at(px - rx * d2, pz - rz * d2, py + 0.6f * u, 0, &yL)) tr = atan2f(yR - yL, 2.0f * d2);
             pitch += (tp - pitch) * 0.2f;
+            roll  += (tr - roll) * 0.2f;
         }
 
-        /* câmera de perseguição suavizada */
         float dh = heading - camHead;
         while (dh > PI_F) dh -= 2.0f * PI_F;
         while (dh < -PI_F) dh += 2.0f * PI_F;
@@ -939,10 +1143,11 @@ int main(void) {
         ScePspFVector3 eye    = { px - cfx * 2.4f * u, py + 0.95f * u, pz - cfz * 2.4f * u };
         ScePspFVector3 center = { px + cfx * 0.8f * u, py + 0.40f * u, pz + cfz * 0.8f * u };
         ScePspFVector3 up     = { 0.0f, 1.0f, 0.0f };
-
         float nearp = fmaxf(0.05f * u, 0.01f), farp = fmaxf(trackExt * 1.2f, 100.0f * u);
 
         sceGuStart(GU_DIRECT, list);
+        sceGuTexScale(1.0f, 1.0f);
+        sceGuTexOffset(0.0f, 0.0f);
         sceGuClearColor(0xFFE0B080);
         sceGuClearDepth(0);
         sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
@@ -958,15 +1163,24 @@ int main(void) {
         sceGumLoadIdentity();
         draw_model(&g_track);
 
-        sceGumLoadIdentity();
-        ScePspFVector3 pos = { px, py, pz };
-        ScePspFVector3 sc = { carScale, carScale, carScale };
-        sceGumTranslate(&pos);
-        sceGumRotateY(-heading);
-        sceGumRotateX(pitch);
+        float ry = py + 0.01f * u;                 /* pequena folga para nao brigar com o asfalto */
+        car_base(px, ry, pz, heading, pitch, roll, carScale);
         sceGumRotateY(carYaw0 + (flip ? PI_F : 0.0f));
-        sceGumScale(&sc);
         draw_model(&g_car);
+
+        if (haveWheel) {
+            for (int k = 0; k < 4; k++) {
+                float sxw = (k & 1) ? wx : -wx;
+                float szw = (k & 2) ? wz : -wz;       /* k<2: frente (-Z) */
+                ScePspFVector3 wp = { sxw, wheelR, szw };
+                car_base(px, ry, pz, heading, pitch, roll, carScale);
+                sceGumTranslate(&wp);
+                if (k < 2) sceGumRotateY(-steerVis * 0.5f);
+                sceGumRotateX(wheelRot);
+                if (WHEEL_MIRROR && sxw < 0) sceGumRotateY(PI_F);
+                draw_model(&g_wheel);
+            }
+        }
 
         sceGuFinish();
         sceGuSync(0, 0);
